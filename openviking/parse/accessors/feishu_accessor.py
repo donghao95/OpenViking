@@ -78,6 +78,14 @@ _MAX_PATH_SEGMENT_BYTES = 240
 _MediaDownloadExtras = Dict[str, List[Optional[str]]]
 
 
+class _UnsupportedFeishuDocumentType(ValueError):
+    """明确区分缺少原生解析器与权限、网络、遍历或预算失败。"""
+
+    def __init__(self, doc_type: str):
+        self.doc_type = doc_type
+        super().__init__(f"Unsupported Feishu document type: {doc_type}")
+
+
 def _redact_feishu_source_url(url: str) -> str:
     """Keep a useful Feishu route in logs without exposing document tokens."""
     parsed = urlparse(str(url))
@@ -997,6 +1005,7 @@ class FeishuAccessor(DataAccessor):
             # Stable order makes collision allocation independent of API page ordering.
             for item in sorted(children, key=lambda item: self._normalize_drive_item(item)[1]):
                 item_type, token, name, url = self._normalize_drive_item(item)
+                file_download_errors: list[Exception] = []
                 try:
                     if not token:
                         raise ValueError("Drive item has no token")
@@ -1018,7 +1027,7 @@ class FeishuAccessor(DataAccessor):
                         plan.visit(depth + 1)
                         path_type = _FEISHU_DRIVE_DOC_TYPES.get(item_type)
                         if item_type != "file" and not path_type:
-                            raise ValueError(f"Unsupported Feishu Drive item type: {item_type}")
+                            raise _UnsupportedFeishuDocumentType(item_type)
                         await self._write_import_content(
                             item_type if item_type == "file" else path_type,
                             token,
@@ -1027,6 +1036,7 @@ class FeishuAccessor(DataAccessor):
                             target_dir,
                             plan,
                             feishu_access_token=feishu_access_token,
+                            _file_download_errors=file_download_errors,
                         )
                 except Exception as exc:
                     self._record_skipped_drive_item(
@@ -1036,6 +1046,15 @@ class FeishuAccessor(DataAccessor):
                         name=name,
                         target_dir=target_dir,
                         error=exc,
+                        # 遍历及全局配额失败可能漏正文，不能当作单个附件失败。
+                        failure_scope=(
+                            "content"
+                            if item_type == "file"
+                            and any(error is exc for error in file_download_errors)
+                            and not plan.download_exhausted
+                            and plan.nodes < plan.max_nodes
+                            else None
+                        ),
                     )
                     if strict:
                         raise
@@ -1062,6 +1081,7 @@ class FeishuAccessor(DataAccessor):
         plan: FeishuImportPlan,
         *,
         feishu_access_token: Optional[str] = None,
+        _file_download_errors: Optional[list[Exception]] = None,
     ) -> Path:
         doc_type = "doc" if doc_type == "docs" else self._WIKI_TYPE_MAP.get(doc_type, doc_type)
         url = url or self._import_doc_url(plan, doc_type, token)
@@ -1072,12 +1092,18 @@ class FeishuAccessor(DataAccessor):
         if plan.download_exhausted:
             raise ValueError("Feishu import download byte limit exceeded")
         if doc_type == "file":
-            content, content_type, filename = await asyncio.to_thread(
-                self._download_drive_file,
-                token,
-                feishu_access_token=feishu_access_token,
-                filename_hint=title,
-            )
+            try:
+                content, content_type, filename = await asyncio.to_thread(
+                    self._download_drive_file,
+                    token,
+                    feishu_access_token=feishu_access_token,
+                    filename_hint=title,
+                )
+            except Exception as exc:
+                if _file_download_errors is not None:
+                    _file_download_errors.append(exc)
+                raise
+            # 全局下载预算不属于单个附件的内容失败，不能加入容错标记。
             plan.account_download(len(content))
             path = self._unique_child_path(
                 target_dir,
@@ -1090,7 +1116,7 @@ class FeishuAccessor(DataAccessor):
             plan.add(path, url, token, "file")
             return path
         if doc_type not in self._DOC_TYPE_HANDLERS:
-            raise ValueError(f"Unsupported Feishu document type: {doc_type}")
+            raise _UnsupportedFeishuDocumentType(doc_type)
         name = self._markdown_file_name(_safe_path_segment(title or token, fallback=token))
         path = self._unique_child_path(target_dir, name, plan.reserved)
         if plan.use_understanding and doc_type in {"docx", "sheets", "base"}:
@@ -1206,12 +1232,14 @@ class FeishuAccessor(DataAccessor):
                 )
                 content_dir.mkdir(parents=True, exist_ok=True)
 
+            file_download_errors: list[Exception] = []
             try:
                 content_path = await self._write_wiki_node_content(
                     node,
                     content_dir,
                     plan=plan,
                     feishu_access_token=feishu_access_token,
+                    _file_download_errors=file_download_errors,
                 )
             except Exception as exc:
                 self._record_skipped_wiki_node(
@@ -1219,6 +1247,14 @@ class FeishuAccessor(DataAccessor):
                     node=node,
                     target_dir=content_dir,
                     error=exc,
+                    # 只标记内容阶段；子节点枚举和遍历限制仍保留失败语义。
+                    failure_scope=(
+                        "content"
+                        if self._normalize_wiki_obj_type(node.obj_type) == "file"
+                        and any(error is exc for error in file_download_errors)
+                        and not plan.download_exhausted
+                        else None
+                    ),
                 )
                 if strict:
                     raise
@@ -1251,6 +1287,7 @@ class FeishuAccessor(DataAccessor):
         *,
         feishu_access_token: Optional[str] = None,
         plan: Optional[FeishuImportPlan] = None,
+        _file_download_errors: Optional[list[Exception]] = None,
     ) -> Optional[Path]:
         if not node.obj_type or not node.obj_token:
             return None
@@ -1263,6 +1300,7 @@ class FeishuAccessor(DataAccessor):
             target_dir,
             plan,
             feishu_access_token=feishu_access_token,
+            _file_download_errors=_file_download_errors,
         )
 
     @staticmethod
@@ -1272,6 +1310,7 @@ class FeishuAccessor(DataAccessor):
         node: _FeishuWikiTreeNode,
         target_dir: Path,
         error: Exception,
+        failure_scope: Optional[str] = None,
     ) -> None:
         message = str(error).replace("\n", " ")
         logger.warning(
@@ -1283,16 +1322,20 @@ class FeishuAccessor(DataAccessor):
         if skipped_items is None:
             return
         token = node.obj_token or node.wiki_node_token
-        skipped_items.append(
-            {
-                "path": str(target_dir / _safe_path_segment(node.title or token, fallback=token)),
-                "name": node.title or token,
-                "type": node.obj_type or "wiki_node",
-                "token": token,
-                "wiki_node_token": node.wiki_node_token,
-                "reason": message,
-            }
-        )
+        item = {
+            "path": str(target_dir / _safe_path_segment(node.title or token, fallback=token)),
+            "name": node.title or token,
+            "type": node.obj_type or "wiki_node",
+            "token": token,
+            "wiki_node_token": node.wiki_node_token,
+            "reason": message,
+        }
+        if failure_scope is not None:
+            item["failure_scope"] = failure_scope
+        if isinstance(error, _UnsupportedFeishuDocumentType):
+            item["status"] = "unsupported"
+            item["unsupported_type"] = error.doc_type
+        skipped_items.append(item)
 
     @staticmethod
     def _wiki_node_dir_name(node: _FeishuWikiTreeNode) -> str:
@@ -1317,6 +1360,7 @@ class FeishuAccessor(DataAccessor):
         name: str,
         target_dir: Path,
         error: Exception,
+        failure_scope: Optional[str] = None,
     ) -> None:
         message = str(error).replace("\n", " ")
         logger.warning(
@@ -1328,15 +1372,19 @@ class FeishuAccessor(DataAccessor):
         )
         if skipped_items is None:
             return
-        skipped_items.append(
-            {
-                "path": str(target_dir / _safe_path_segment(name or token, fallback=token)),
-                "name": name or token,
-                "type": item_type,
-                "token": token,
-                "reason": message,
-            }
-        )
+        item = {
+            "path": str(target_dir / _safe_path_segment(name or token, fallback=token)),
+            "name": name or token,
+            "type": item_type,
+            "token": token,
+            "reason": message,
+        }
+        if failure_scope is not None:
+            item["failure_scope"] = failure_scope
+        if isinstance(error, _UnsupportedFeishuDocumentType):
+            item["status"] = "unsupported"
+            item["unsupported_type"] = error.doc_type
+        skipped_items.append(item)
 
     def _fetch_drive_folder_children_page(
         self,
@@ -1692,9 +1740,9 @@ class FeishuAccessor(DataAccessor):
     def _call_api(self, method, request, feishu_access_token: Optional[str] = None):
         option = self._user_request_option(feishu_access_token)
         if option is not None:
-            return method(request, option)
+            return FeishuApiSession.call_with_read_retry(request, lambda: method(request, option))
         with self._require_session().tenant_token_cache_scope():
-            return method(request)
+            return FeishuApiSession.call_with_read_retry(request, lambda: method(request))
 
     @classmethod
     def _raw_feishu_error(cls, raw_resp: Any) -> Optional[Tuple[int, str]]:
@@ -1739,11 +1787,15 @@ class FeishuAccessor(DataAccessor):
         option = self._user_request_option(feishu_access_token) or RequestOption()
         if feishu_access_token:
             verify(client._config, request, option)
-            raw_resp = Transport.execute(client._config, request, option)
+            raw_resp = FeishuApiSession.call_with_read_retry(
+                request, lambda: Transport.execute(client._config, request, option)
+            )
         else:
             with self._require_session().tenant_token_cache_scope():
                 verify(client._config, request, option)
-                raw_resp = Transport.execute(client._config, request, option)
+                raw_resp = FeishuApiSession.call_with_read_retry(
+                    request, lambda: Transport.execute(client._config, request, option)
+                )
 
         response = BaseResponse()
         feishu_error = self._raw_feishu_error(raw_resp)

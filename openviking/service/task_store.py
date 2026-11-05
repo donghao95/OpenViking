@@ -13,7 +13,7 @@ import time
 from collections import defaultdict
 from collections.abc import AsyncIterator, Callable, Collection
 from copy import deepcopy
-from dataclasses import dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from typing import Any, Dict, List, Optional, Protocol
 
@@ -400,9 +400,10 @@ class _WorkMutationResult:
 class PersistentTaskStore(TaskWorkStore):
     """File Task store with process-local Work state reconstructed from QueueFS.
 
-    Only Task records are durable. QueueFS startup recovery can reconstruct
-    unacknowledged Work, but terminal Work history, timings, and errors may be
-    incomplete after restart.
+    QueueFS startup recovery reconstructs unacknowledged Work. Failed Work is
+    checkpointed with the Task so a restart cannot erase a known failure while
+    sibling Work is still open. Successful Work history and timings remain
+    process-local until the Task is finalized.
     """
 
     ROOT_PREFIX = "/local"
@@ -1390,6 +1391,10 @@ class PersistentTaskStore(TaskWorkStore):
                 candidate_task: Optional[TaskRecord] = None
                 candidate_work_set: Optional[_WorkSet] = None
                 finalized = False
+                failure_changed = mutation.changed and (
+                    (existing is not None and existing.state is WorkState.FAILED)
+                    or (mutation.work is not None and mutation.work.state is WorkState.FAILED)
+                )
                 if (
                     try_finalize
                     and open_count == 0
@@ -1406,9 +1411,20 @@ class PersistentTaskStore(TaskWorkStore):
                     candidate_work_set = _WorkSet(works, open_count)
                     finalized = finalize_task(candidate_task, candidate_work_set.works.values())
 
-                if finalized:
+                if failure_changed and candidate_task is None:
+                    candidate_task = deepcopy(live_task)
+                    previous = deepcopy(live_task)
+                    works = dict(work_set.works)
+                    if mutation.work is None:
+                        works.pop(work_id, None)
+                    else:
+                        works[work_id] = mutation.work
+                    candidate_work_set = _WorkSet(works, open_count)
+
+                if finalized or failure_changed:
                     assert candidate_task is not None
                     assert candidate_work_set is not None
+                    _checkpoint_failed_works(candidate_task, candidate_work_set.works.values())
                     candidate_task.updated_at = TaskRecord.next_updated_at(
                         candidate_task.updated_at
                     )
@@ -1504,8 +1520,11 @@ class PersistentTaskStore(TaskWorkStore):
             return
         owner = (task.account_id, task.user_id, task.task_id)
         with self._lock:
-            self._task_cache.setdefault(owner, task)
-            self._work_sets.setdefault(owner, _WorkSet({}))
+            if owner in self._task_cache:
+                return
+            restored = _WorkSet(_restore_failed_works(task))
+            self._task_cache[owner] = task
+            self._work_sets[owner] = restored
 
     async def _read(self, path: str) -> Any:
         return await run_to_completion(lambda: self._agfs.read(path))
@@ -1683,6 +1702,41 @@ def _inactive_task_result(task: TaskRecord, message: str) -> StoreOperationResul
         StoreOperationCode.INVALID_STATE,
         f"{message}: task is {task.status.value}",
     )
+
+
+_FAILED_WORK_CHECKPOINT = "_file_failed_works_v1"
+
+
+def _checkpoint_failed_works(task: TaskRecord, works: Collection[WorkRecord]) -> None:
+    """仅把失败事实随Task原子落盘，不持久化每次成功或排队变化。"""
+    failed = [
+        {**asdict(work), "state": work.state.value}
+        for work in works
+        if work.state is WorkState.FAILED
+    ]
+    if failed:
+        task._extra_fields[_FAILED_WORK_CHECKPOINT] = failed
+    else:
+        task._extra_fields.pop(_FAILED_WORK_CHECKPOINT, None)
+
+
+def _restore_failed_works(task: TaskRecord) -> Dict[str, WorkRecord]:
+    """恢复失败记录；不把其它身份或非失败记录当成恢复依据。"""
+    payloads = task._extra_fields.get(_FAILED_WORK_CHECKPOINT, [])
+    if not isinstance(payloads, list):
+        raise ValueError("Invalid failed Work checkpoint")
+    works: Dict[str, WorkRecord] = {}
+    for payload in payloads:
+        work = WorkRecord(**{**payload, "state": WorkState(payload["state"])})
+        if (
+            work.state is not WorkState.FAILED
+            or (work.account_id, work.user_id, work.task_id)
+            != (task.account_id, task.user_id, task.task_id)
+            or work.work_id in works
+        ):
+            raise ValueError("Invalid failed Work checkpoint owner or state")
+        works[work.work_id] = work
+    return works
 
 
 def _task_to_payload(task: TaskRecord) -> Dict[str, Any]:

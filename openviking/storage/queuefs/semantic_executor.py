@@ -5,6 +5,7 @@
 import asyncio
 import re
 import threading
+from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Mapping, Optional, Set
 from weakref import WeakKeyDictionary
@@ -96,6 +97,37 @@ class ScheduledTreeWork:
     work: SemanticTreeWork
 
 
+class _SemanticTreeWorkQueue(asyncio.Queue[ScheduledTreeWork]):
+    """语义树之间轮转，同一棵树内仍按节点提交顺序处理。"""
+
+    def _init(self, maxsize: int) -> None:
+        self._queue: deque["SemanticTreeExecutor"] = deque()
+        self._tree_work: dict["SemanticTreeExecutor", deque[ScheduledTreeWork]] = {}
+        self._pending_count = 0
+
+    def qsize(self) -> int:
+        return self._pending_count
+
+    def _put(self, item: ScheduledTreeWork) -> None:
+        pending = self._tree_work.get(item.executor)
+        if pending is None:
+            pending = self._tree_work[item.executor] = deque()
+            self._queue.append(item.executor)
+        pending.append(item)
+        self._pending_count += 1
+
+    def _get(self) -> ScheduledTreeWork:
+        executor = self._queue.popleft()
+        pending = self._tree_work[executor]
+        item = pending.popleft()
+        if pending:
+            self._queue.append(executor)
+        else:
+            del self._tree_work[executor]
+        self._pending_count -= 1
+        return item
+
+
 class SemanticTreeScheduler:
     """Shared node executor for semantic DAG work in one event loop."""
 
@@ -103,7 +135,7 @@ class SemanticTreeScheduler:
 
     def __init__(self, max_workers: int):
         self._max_workers = max(1, max_workers)
-        self._queue: asyncio.Queue[ScheduledTreeWork] = asyncio.Queue()
+        self._queue: asyncio.Queue[ScheduledTreeWork] = _SemanticTreeWorkQueue()
         self._workers: Set[asyncio.Task] = set()
 
     def configure(self, max_workers: int) -> None:

@@ -888,7 +888,7 @@ class MultiCredentialVLM(VLMBase):
         # credential found this cycle serves it and becomes the new active one
         # (fast failover). The slow, sticky failback to higher priority is still
         # handled by maybe_failback() across requests.
-        start = self._switcher.maybe_failback()
+        start, generation = self._switcher.begin_request()
         n = self._switcher.n
 
         for offset in range(n):
@@ -896,10 +896,11 @@ class MultiCredentialVLM(VLMBase):
             credential_id = self._credential_ids[idx]
             vlm_instance = self._vlm_instances[idx]
 
+            generation = self._switcher.generation_for_attempt(idx, generation)
             try:
                 method = getattr(vlm_instance, method_name)
                 result = method(*args, **kwargs)
-                self._switcher.commit_success(idx)
+                self._switcher.commit_success(idx, generation=generation)
                 return result
             except Exception as exc:
                 _annotate_vlm_error(exc, vlm_instance)
@@ -937,7 +938,7 @@ class MultiCredentialVLM(VLMBase):
         aggregated_errors = []
 
         # See the sync variant for the ring-traversal rationale.
-        start = self._switcher.maybe_failback()
+        start, generation = self._switcher.begin_request()
         n = self._switcher.n
 
         for offset in range(n):
@@ -945,10 +946,11 @@ class MultiCredentialVLM(VLMBase):
             credential_id = self._credential_ids[idx]
             vlm_instance = self._vlm_instances[idx]
 
+            generation = self._switcher.generation_for_attempt(idx, generation)
             try:
                 method = getattr(vlm_instance, method_name)
                 result = await method(*args, **kwargs)
-                self._switcher.commit_success(idx)
+                self._switcher.commit_success(idx, generation=generation)
                 return result
             except Exception as exc:
                 _annotate_vlm_error(exc, vlm_instance)
@@ -979,7 +981,7 @@ class MultiCredentialVLM(VLMBase):
         already delivered output, so subsequent errors fail the request.
         """
         aggregated_errors = []
-        start = self._switcher.maybe_failback()
+        start, generation = self._switcher.begin_request()
         n = self._switcher.n
 
         for offset in range(n):
@@ -988,11 +990,12 @@ class MultiCredentialVLM(VLMBase):
             vlm_instance = self._vlm_instances[idx]
             emitted = False
 
+            generation = self._switcher.generation_for_attempt(idx, generation)
             try:
                 async for item in stream_factory(vlm_instance):
                     emitted = True
                     yield item
-                self._switcher.commit_success(idx)
+                self._switcher.commit_success(idx, generation=generation)
                 return
             except Exception as exc:
                 _annotate_vlm_error(exc, vlm_instance)
@@ -1116,7 +1119,7 @@ class MultiCredentialVLM(VLMBase):
         media_type: str,
     ) -> str:
         size_bytes = media_path.stat().st_size if media_path.exists() else 0
-        start = self._switcher.maybe_failback()
+        start, generation = self._switcher.begin_request()
         errors = []
         attempted = False
         active_credential_failed = False
@@ -1133,6 +1136,7 @@ class MultiCredentialVLM(VLMBase):
 
             attempted = True
             credential_id = self._credential_ids[idx]
+            generation = self._switcher.generation_for_attempt(idx, generation)
             try:
                 result = await vlm.get_media_completion_async(
                     prompt=prompt,
@@ -1143,7 +1147,7 @@ class MultiCredentialVLM(VLMBase):
                 # Capability routing alone must not change the credential used
                 # by text and vision calls.
                 if idx == start or active_credential_failed:
-                    self._switcher.commit_success(idx)
+                    self._switcher.commit_success(idx, generation=generation)
                 return result
             except Exception as error:
                 _annotate_vlm_error(error, vlm)

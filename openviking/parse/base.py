@@ -51,6 +51,12 @@ def format_table_to_markdown(rows: List[List[str]], has_header: bool = True) -> 
     Returns:
         Markdown formatted table string
     """
+    # 保留原始列数，即使最后几行只有空单元格且比正文更宽。
+    col_count = max((len(row) for row in rows), default=0)
+    last_row = len(rows)
+    while last_row and not any(str(cell).strip() for cell in rows[last_row - 1]):
+        last_row -= 1
+    rows = rows[:last_row]
     if not rows:
         return ""
 
@@ -59,23 +65,16 @@ def format_table_to_markdown(rows: List[List[str]], has_header: bool = True) -> 
         ["<br>".join(str(cell).replace("|", "\\|").splitlines()) for cell in row] for row in rows
     ]
 
-    # Calculate maximum width for each column; a delimiter cell needs at least "---"
-    col_count = max(len(row) for row in rows)
-    col_widths = [3] * col_count
-    for row in rows:
-        for i, cell in enumerate(row):
-            col_widths[i] = max(col_widths[i], len(cell))
-
     lines = []
     for row_idx, row in enumerate(rows):
         # Pad missing columns
         padded_row = row + [""] * (col_count - len(row))
-        cells = [cell.ljust(col_widths[i]) for i, cell in enumerate(padded_row)]
-        lines.append("| " + " | ".join(cells) + " |")
+        # 紧凑输出，避免长单元格将表头及空行补成超长分段。
+        lines.append("| " + " | ".join(padded_row) + " |")
 
         # Add separator row after header
-        if row_idx == 0 and has_header and len(rows) > 1:
-            separator = ["-" * w for w in col_widths]
+        if row_idx == 0 and has_header:
+            separator = ["---"] * col_count
             lines.append("| " + " | ".join(separator) + " |")
 
     return "\n".join(lines)
