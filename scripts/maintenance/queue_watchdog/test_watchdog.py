@@ -535,6 +535,15 @@ class TransportTests(unittest.TestCase):
                     monitor.request("/synthetic")
                 self.assertEqual(caught.exception.kind, expected)
 
+    def test_interrupted_http_response_is_a_probe_failure(self):
+        monitor = object.__new__(w.Monitor)
+        monitor.base, monitor.headers, monitor.observer_headers = "http://localhost", {}, {}
+        error = w.http.client.IncompleteRead(b"synthetic", 100)
+        with patch.object(w.urllib.request, "urlopen", side_effect=error):
+            with self.assertRaises(w.ProbeError) as caught:
+                monitor.request("/synthetic")
+            self.assertEqual(caught.exception.kind, "unreachable")
+
     def test_root_model_status_without_usage_does_not_break_collector(self):
         monitor = object.__new__(w.Monitor)
         responses = {

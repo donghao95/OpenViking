@@ -5,6 +5,7 @@ import argparse
 import contextlib
 import datetime
 import fcntl
+import http.client
 import json
 import os
 import subprocess
@@ -136,7 +137,13 @@ class Monitor:
                 else "schema"
             )
             raise ProbeError(kind) from None
-        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            ConnectionError,
+            OSError,
+            http.client.HTTPException,
+        ):
             raise ProbeError("unreachable") from None
         except (ValueError, TypeError):
             raise ProbeError("schema") from None
