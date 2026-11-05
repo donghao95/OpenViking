@@ -1,0 +1,22 @@
+[Unit]
+Description=OpenViking queue progress recovery
+After=docker.service
+ConditionPathExists=@ACCESS_FILE@
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/openviking-queue-recovery/current
+ExecStart=/usr/bin/python3 /opt/openviking-queue-recovery/current/watchdog.py --config /etc/openviking-queue-recovery/config.private.json --apply
+TimeoutStartSec=180
+UMask=0077
+Environment=PYTHONDONTWRITEBYTECODE=1
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/openviking-queue-recovery @DEPLOYMENT_LOCK@
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryMax=256M
+CPUQuota=20%
