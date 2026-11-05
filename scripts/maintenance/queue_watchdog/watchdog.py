@@ -51,6 +51,7 @@ def plan(state, sample, now, policy, lock_error=False):
     changed = previous is None or any(
         sample[key] != previous[key] for key in ("instance", "progress")
     )
+    changed = changed or (sample["busy"] and previous is not None and not previous["busy"])
     if changed or not sample["busy"] or now < state.get("last_progress", now):
         state["last_progress"] = now
     state["sample"] = sample
@@ -60,6 +61,9 @@ def plan(state, sample, now, policy, lock_error=False):
         state.pop("pending_restart")
     if not sample["busy"]:
         return "idle"
+    if sample.get("protected_work"):
+        state["last_progress"] = now
+        return "external_work_active"
     stalled = now - state["last_progress"]
     if lock_error and stalled >= policy["lock_stall_seconds"]:
         return "lock_stall"
@@ -68,12 +72,12 @@ def plan(state, sample, now, policy, lock_error=False):
     return "progress" if changed else "observing"
 
 
-def permitted(state, now, policy, escalation=False):
+def permitted(state, now, policy):
     recent = [t for t in state.get("restarts", []) if now - t < policy["window_seconds"]]
     state["restarts"] = recent
     if len(recent) >= policy["max_restarts"]:
         return False
-    return not recent or escalation or now - recent[-1] >= policy["cooldown_seconds"]
+    return not recent or now - recent[-1] >= policy["cooldown_seconds"]
 
 
 class Monitor:
@@ -102,7 +106,7 @@ class Monitor:
             "lock_stall_seconds": 600,
             "stall_seconds": 2400,
             "unhealthy_seconds": 600,
-            "startup_grace_seconds": 600,
+            "observation_gap_seconds": 180,
             "cooldown_seconds": 3600,
             "window_seconds": 21600,
             "max_restarts": 2,
@@ -136,7 +140,7 @@ class Monitor:
             raise ProbeError("unreachable") from None
         except (ValueError, TypeError):
             raise ProbeError("schema") from None
-        if value.get("status") != "ok":
+        if not isinstance(value, dict) or value.get("status") != "ok":
             raise ProbeError("schema")
         return value.get("result", value)
 
@@ -162,7 +166,15 @@ class Monitor:
         sample = {
             "instance": config["restart"]["instance_id"],
             "progress": progress,
-            "busy": any(q["pending"] + q["in_progress"] > 0 for q in queues),
+            "busy": any(
+                q["pending"] + q["in_progress"] > 0
+                for q in queues
+                if q["queue"] != "Semantic-Nodes"
+            ),
+            "protected_work": any(
+                q["queue"] == "ExternalTask" and q["in_progress"] > 0 for q in queues
+            )
+            or any("compile" in t.get("task_type", "") for t in tasks),
             "attempt_timeout": max(
                 vlm.get("timeout", 0), vlm.get("media", {}).get("file_processing_timeout", 0)
             ),
@@ -209,12 +221,33 @@ class Monitor:
     def tick(self, now=None):
         now = time.time() if now is None else now
         if Path(self.config["pause_file"]).exists():
+            self.state["needs_baseline"] = True
+            self.state["last_observation"] = {"status": "paused", "at": now}
+            save(self.path, self.state)
             return {"status": "paused"}
+        last_check = self.state.get("last_check_at")
+        if (
+            self.state.pop("needs_baseline", False)
+            or last_check is None
+            or now < last_check
+            or now - last_check > self.policy["observation_gap_seconds"]
+        ):
+            self.state["last_progress"] = now
+            self.state.pop("unhealthy_since", None)
+        self.state["last_check_at"] = now
         config = None
         try:
             sample, config = self.collect()
         except ProbeError as error:
-            if error.kind in ("auth", "schema", "http"):
+            if error.kind in ("auth", "schema"):
+                self.state.pop("unhealthy_since", None)
+                self.state["needs_baseline"] = True
+                self.state["last_observation"] = {
+                    "status": "probe_error",
+                    "kind": error.kind,
+                    "at": now,
+                }
+                save(self.path, self.state)
                 return {"status": "probe_error", "kind": error.kind}
             self.state.setdefault("unhealthy_since", now)
             reason = (
@@ -223,8 +256,9 @@ class Monitor:
                 else "probing"
             )
             # 没有成功读取过业务状态时，不凭网络错误启动恢复。
-            if not self.state.get("sample"):
-                reason = "probing"
+            previous = self.state.get("sample") or {}
+            if not previous.get("busy") or previous.get("protected_work"):
+                reason = "unknown_work_state"
         else:
             reason = plan(self.state, sample, now, self.policy)
             if (
@@ -240,17 +274,12 @@ class Monitor:
                 )
             try:
                 self.resume_coordinator(now)
+                self.state.pop("coordinator_error", None)
             except (KeyError, ValueError, OSError, subprocess.SubprocessError) as error:
                 self.state["coordinator_error"] = type(error).__name__
         action = {"status": reason, "at": now}
         if reason in ("lock_stall", "stalled", "unreachable"):
-            pending = self.state.get("pending_restart")
-            escalation = bool(
-                reason == "unreachable"
-                and pending
-                and now - pending["at"] >= self.policy["startup_grace_seconds"]
-            )
-            if not permitted(self.state, now, self.policy, escalation):
+            if not permitted(self.state, now, self.policy):
                 action["status"] = "recovery_budget_exhausted"
             elif not self.apply:
                 action["would_restart"] = True
@@ -262,6 +291,8 @@ class Monitor:
                     if (
                         latest["instance"] != sample["instance"]
                         or latest["progress"] != sample["progress"]
+                        or not latest["busy"]
+                        or latest.get("protected_work")
                     ):
                         plan(self.state, latest, now, self.policy)
                         action["status"] = "progress_before_restart"
@@ -305,6 +336,13 @@ def main():
             return
         with locked(config["deployment_lock"]) as acquired:
             if not acquired:
+                previous = json.loads(state.read_text()) if state.exists() else {}
+                previous["needs_baseline"] = True
+                previous["last_observation"] = {
+                    "status": "deployment_in_progress",
+                    "at": time.time(),
+                }
+                save(state, previous)
                 print(json.dumps({"status": "deployment_in_progress"}))
                 return
             try:

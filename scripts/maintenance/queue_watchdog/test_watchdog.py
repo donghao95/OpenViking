@@ -20,7 +20,7 @@ POLICY = {
     "lock_stall_seconds": 600,
     "stall_seconds": 2400,
     "unhealthy_seconds": 600,
-    "startup_grace_seconds": 600,
+    "observation_gap_seconds": 180,
     "cooldown_seconds": 3600,
     "window_seconds": 21600,
     "max_restarts": 2,
@@ -54,6 +54,12 @@ class FakeMonitor(w.Monitor):
         self.lock_failure = False
         self.calls = []
         self.samples = []
+
+    def advance(self, now):
+        previous = self.state.get("last_check_at", now)
+        for timestamp in range(int(previous) + 60, int(now), 60):
+            self.tick(timestamp)
+        return self.tick(now)
 
     def collect(self):
         if self.failure:
@@ -124,11 +130,11 @@ class RecoveryTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name)
         self.monitor = FakeMonitor(self.path)
-        self.monitor.tick(NOW)
+        self.monitor.advance(NOW)
 
     def test_native_restart_uses_current_revision_and_persists_intent(self):
         self.monitor.lock_failure = True
-        result = self.monitor.tick(NOW + 600)
+        result = self.monitor.advance(NOW + 600)
         self.assertEqual(result["status"], "native_restart_accepted")
         self.assertIn(("/api/v1/admin/restart", {"revision": "same-config"}), self.monitor.calls)
         saved = json.loads(self.monitor.path.read_text())
@@ -138,35 +144,36 @@ class RecoveryTests(unittest.TestCase):
     def test_observe_mode_and_maintenance_do_not_restart(self):
         self.monitor.apply = False
         self.monitor.lock_failure = True
-        self.assertTrue(self.monitor.tick(NOW + 600)["would_restart"])
+        self.assertTrue(self.monitor.advance(NOW + 600)["would_restart"])
         self.assertEqual(self.monitor.calls, [])
         Path(self.monitor.config["pause_file"]).touch()
-        self.assertEqual(self.monitor.tick(NOW + 1000)["status"], "paused")
+        self.assertEqual(self.monitor.advance(NOW + 1000)["status"], "paused")
 
     def test_progress_between_probes_aborts_restart(self):
         self.monitor.lock_failure = True
+        self.monitor.advance(NOW + 599)
         self.monitor.samples = [sample(), sample(nodes=1)]
-        self.assertEqual(self.monitor.tick(NOW + 600)["status"], "progress_before_restart")
+        self.assertEqual(self.monitor.advance(NOW + 600)["status"], "progress_before_restart")
         self.assertEqual(self.monitor.state.get("restarts", []), [])
 
     def test_auth_or_schema_error_never_restarts(self):
         for failure in ("auth", "schema"):
             self.monitor.failure = failure
-            self.assertEqual(self.monitor.tick(NOW + 10000)["status"], "probe_error")
+            self.assertEqual(self.monitor.advance(NOW + 10000)["status"], "probe_error")
         self.assertEqual(self.monitor.calls, [])
 
     def test_authenticated_liveness_failure_needs_sustained_observation(self):
         self.monitor.failure = "unreachable"
-        self.assertEqual(self.monitor.tick(NOW + 1)["status"], "probing")
-        self.assertEqual(self.monitor.tick(NOW + 600)["status"], "probing")
-        self.assertEqual(self.monitor.tick(NOW + 601)["status"], "container_restarted")
+        self.assertEqual(self.monitor.advance(NOW + 1)["status"], "probing")
+        self.assertEqual(self.monitor.advance(NOW + 600)["status"], "probing")
+        self.assertEqual(self.monitor.advance(NOW + 601)["status"], "container_restarted")
         self.assertIn(["docker", "restart", "--time", "60", "synthetic-ov"], self.monitor.calls)
 
     def test_no_prior_success_means_no_blind_container_restart(self):
         self.monitor.state = {}
         self.monitor.failure = "unreachable"
-        self.monitor.tick(NOW)
-        self.assertEqual(self.monitor.tick(NOW + 10000)["status"], "probing")
+        self.monitor.advance(NOW)
+        self.assertEqual(self.monitor.advance(NOW + 10000)["status"], "unknown_work_state")
         self.assertEqual(self.monitor.calls, [])
 
     def test_uncertain_post_is_not_replayed_after_process_restart(self):
@@ -175,25 +182,26 @@ class RecoveryTests(unittest.TestCase):
 
         self.monitor.request = lost_response
         self.monitor.lock_failure = True
-        self.assertEqual(self.monitor.tick(NOW + 600)["status"], "restart_outcome_uncertain")
+        self.assertEqual(self.monitor.advance(NOW + 600)["status"], "restart_outcome_uncertain")
         monitor = FakeMonitor(self.path)
         monitor.lock_failure = True
-        self.assertEqual(monitor.tick(NOW + 1200)["status"], "recovery_budget_exhausted")
+        self.assertEqual(monitor.advance(NOW + 1200)["status"], "recovery_budget_exhausted")
         self.assertEqual(monitor.calls, [])
 
-    def test_wedged_native_restart_has_one_bounded_container_escalation(self):
+    def test_wedged_native_restart_does_not_bypass_hourly_cooldown(self):
         self.monitor.lock_failure = True
-        self.monitor.tick(NOW + 600)
+        self.monitor.advance(NOW + 600)
         self.monitor.failure = "unreachable"
-        self.monitor.tick(NOW + 601)
-        self.assertEqual(self.monitor.tick(NOW + 1201)["status"], "container_restarted")
-        self.assertEqual(self.monitor.tick(NOW + 10000)["status"], "recovery_budget_exhausted")
+        self.monitor.advance(NOW + 601)
+        self.assertEqual(self.monitor.advance(NOW + 1201)["status"], "recovery_budget_exhausted")
+        self.assertEqual(self.monitor.advance(NOW + 4200)["status"], "container_restarted")
+        self.assertEqual(self.monitor.advance(NOW + 10000)["status"], "recovery_budget_exhausted")
 
     def test_container_identity_mismatch_blocks_mutation(self):
         self.monitor.lock_failure = True
         self.monitor.validate_container = lambda: (_ for _ in ()).throw(ValueError("mismatch"))
         with self.assertRaises(ValueError):
-            self.monitor.tick(NOW + 600)
+            self.monitor.advance(NOW + 600)
         self.assertEqual(self.monitor.calls, [])
 
     def test_coordinator_failure_isolated_from_core_monitor(self):
@@ -201,11 +209,144 @@ class RecoveryTests(unittest.TestCase):
             raise OSError("simulated")
 
         self.monitor.resume_coordinator = failed
-        self.assertEqual(self.monitor.tick(NOW + 1)["status"], "observing")
+        self.assertEqual(self.monitor.advance(NOW + 1)["status"], "observing")
         self.assertEqual(self.monitor.state["coordinator_error"], "OSError")
+
+    def test_empty_queue_with_old_lock_errors_never_restarts(self):
+        self.monitor.current = sample(busy=False)
+        self.monitor.lock_failure = True
+        self.assertEqual(self.monitor.tick(NOW + 1)["status"], "idle")
+        self.assertEqual(self.monitor.tick(NOW + 86400)["status"], "idle")
+        self.assertEqual(self.monitor.calls, [])
+
+    def test_new_work_after_long_idle_gets_a_fresh_stall_window(self):
+        self.monitor.current = sample(busy=False)
+        self.monitor.tick(NOW + 1)
+        self.monitor.tick(NOW + 86400)
+        self.monitor.current = sample()
+        self.monitor.lock_failure = True
+        self.assertEqual(self.monitor.tick(NOW + 86401)["status"], "progress")
+        self.assertEqual(self.monitor.advance(NOW + 87000)["status"], "observing")
+        self.assertEqual(self.monitor.calls, [])
+
+    def test_queue_drained_between_probes_cancels_restart(self):
+        self.monitor.lock_failure = True
+        self.monitor.advance(NOW + 599)
+        self.monitor.samples = [sample(), sample(busy=False)]
+        self.assertEqual(self.monitor.tick(NOW + 600)["status"], "progress_before_restart")
+        self.assertEqual(self.monitor.state.get("restarts", []), [])
+
+    def test_probe_failures_after_idle_are_unknown_not_backlog(self):
+        self.monitor.current = sample(busy=False)
+        self.monitor.tick(NOW + 1)
+        self.monitor.failure = "unreachable"
+        self.assertEqual(self.monitor.advance(NOW + 3000)["status"], "unknown_work_state")
+        self.assertEqual(self.monitor.calls, [])
+
+    def test_observation_gap_requires_an_entire_new_stall_window(self):
+        self.monitor.lock_failure = True
+        self.assertEqual(self.monitor.tick(NOW + 10000)["status"], "observing")
+        self.assertEqual(self.monitor.advance(NOW + 10599)["status"], "observing")
+        self.assertEqual(self.monitor.calls, [])
+        self.assertEqual(self.monitor.tick(NOW + 10600)["status"], "native_restart_accepted")
+
+    def test_auth_failure_breaks_the_continuous_unreachable_window(self):
+        self.monitor.failure = "unreachable"
+        self.monitor.tick(NOW + 1)
+        self.monitor.advance(NOW + 590)
+        self.monitor.failure = "auth"
+        self.assertEqual(self.monitor.tick(NOW + 591)["status"], "probe_error")
+        self.monitor.failure = "unreachable"
+        self.monitor.tick(NOW + 592)
+        self.assertEqual(self.monitor.advance(NOW + 1191)["status"], "probing")
+        self.assertEqual(self.monitor.calls, [])
+
+    def test_long_external_compile_is_protected_from_global_restart(self):
+        self.monitor.current["protected_work"] = True
+        self.monitor.lock_failure = True
+        self.assertEqual(self.monitor.advance(NOW + 3000)["status"], "external_work_active")
+        self.monitor.failure = "unreachable"
+        self.assertEqual(self.monitor.advance(NOW + 4000)["status"], "unknown_work_state")
+        self.assertEqual(self.monitor.calls, [])
+
+    def test_pause_resume_rebaselines_even_without_a_long_observation_gap(self):
+        self.monitor.lock_failure = True
+        self.monitor.advance(NOW + 599)
+        pause = Path(self.monitor.config["pause_file"])
+        pause.touch()
+        self.assertEqual(self.monitor.tick(NOW + 600)["status"], "paused")
+        pause.unlink()
+        self.assertEqual(self.monitor.tick(NOW + 601)["status"], "observing")
+        self.assertEqual(self.monitor.calls, [])
 
 
 class TransportTests(unittest.TestCase):
+    def test_only_virtual_nodes_and_historical_errors_mean_no_durable_backlog(self):
+        monitor = object.__new__(w.Monitor)
+        responses = {
+            "/api/v1/admin/configuration?source=file": {
+                "content": "{}",
+                "restart": {"instance_id": "one"},
+            },
+            "/api/v1/observer/queue?format=json": {
+                "status": {
+                    "queues": [
+                        {
+                            "queue": "AddResource",
+                            "processed": 100,
+                            "errors": 9,
+                            "pending": 0,
+                            "in_progress": 0,
+                        },
+                        {
+                            "queue": "Semantic-Nodes",
+                            "processed": 1000,
+                            "errors": 7,
+                            "pending": 200,
+                            "in_progress": 32,
+                        },
+                    ]
+                }
+            },
+            "/api/v1/observer/models?format=json": {
+                "status": {
+                    "vlm": [{"Model": "synthetic", "Calls": 99}],
+                    "embedding": [],
+                    "rerank": [],
+                }
+            },
+            "/api/v1/tasks?status=running&include_internal=true&limit=200": [
+                {"task_id": "old-task", "stage": "processing_queue"}
+            ],
+        }
+        monitor.request = lambda path: responses[path]
+        current, _ = monitor.collect()
+        self.assertFalse(current["busy"])
+
+    def test_deployment_lock_blocks_all_probes_and_rebaselines_resume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / "deploy.lock").touch()
+            w.save(
+                path / "config",
+                {"state_file": str(path / "state"), "deployment_lock": str(path / "deploy.lock")},
+            )
+            with w.locked(path / "deploy.lock"):
+                result = subprocess.run(
+                    [
+                        "python3",
+                        str(Path(__file__).with_name("watchdog.py")),
+                        "--config",
+                        str(path / "config"),
+                        "--apply",
+                    ],
+                    text=True,
+                    capture_output=True,
+                    check=True,
+                )
+            self.assertEqual(json.loads(result.stdout)["status"], "deployment_in_progress")
+            self.assertTrue(json.loads((path / "state").read_text())["needs_baseline"])
+
     def test_real_http_stall_recovery_uses_owner_for_observation_and_root_for_restart(self):
         observed = []
         runtime = {"instance": "first", "restarts": 0}
@@ -227,12 +368,19 @@ class TransportTests(unittest.TestCase):
                         "status": {
                             "queues": [
                                 {
+                                    "queue": "Semantic",
+                                    "pending": 0,
+                                    "in_progress": 1,
+                                    "processed": 0,
+                                    "errors": 0,
+                                },
+                                {
                                     "queue": "Semantic-Nodes",
                                     "pending": 2,
                                     "in_progress": 1,
                                     "processed": 0,
                                     "errors": 0,
-                                }
+                                },
                             ]
                         }
                     }
@@ -309,6 +457,8 @@ class TransportTests(unittest.TestCase):
 
                 monitor.run = docker
                 monitor.tick(NOW)
+                for timestamp in range(NOW + 60, NOW + 600, 60):
+                    monitor.tick(timestamp)
                 self.assertEqual(monitor.tick(NOW + 600)["status"], "native_restart_accepted")
                 self.assertEqual(monitor.tick(NOW + 601)["status"], "progress")
                 self.assertEqual(runtime["restarts"], 1)
