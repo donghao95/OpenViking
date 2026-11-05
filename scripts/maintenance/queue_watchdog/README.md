@@ -50,4 +50,6 @@ python3 watchdog.py --config /srv/ov/recovery/config.private.json --apply
 python3 -m unittest discover -s scripts/maintenance/queue_watchdog -p 'test_*.py' -v
 ```
 
-用 systemd oneshot service 与每分钟 timer 运行固定提交的脚本，设置 `TimeoutStartSec=180`，仅给该脚本所需的状态目录、接入文件、Docker 和可选服务管理权限。停用 timer 即可回退；暂停文件适合临时维护。不要为了验证恢复而故意卡住生产模型、取消业务任务或向生产队列注入错误；隔离测试覆盖停滞、持续进展、鉴权失败、维护窗口、未知 POST、容器身份、进程重建、冷却与预算。
+附带 systemd oneshot service 模板和每分钟 timer。将模板的 `@ACCESS_FILE@`、`@DEPLOYMENT_LOCK@` 替换为本机实际路径，状态文件放在 `/var/lib/openviking-queue-recovery`；`/opt/openviking-queue-recovery/current` 必须指向固定提交的只读发布目录。启用前用 `systemd-analyze verify` 校验生成的单元，并完成服务器只观察验证。
+
+服务设置 `TimeoutStartSec=180`、只读文件系统和明确的状态／部署锁写入路径。停用 timer 即可回退；暂停文件适合临时维护。不要为了验证恢复而故意卡住生产模型、取消业务任务或向生产队列注入错误；隔离测试覆盖停滞、持续进展、鉴权失败、维护窗口、未知 POST、容器身份、进程重建、冷却与预算。
