@@ -690,6 +690,7 @@ class OrderedCredentialSwitcher:
         # Runtime state (protected by _lock)
         self._lock = threading.Lock()
         self._active_idx = 0
+        self._generation = 0
         self._last_switch_time: float = 0.0
         self._active_request_count = 0
 
@@ -709,19 +710,33 @@ class OrderedCredentialSwitcher:
         Returns the (possibly updated) active credential index.
         """
         with self._lock:
-            if self._active_idx > 0:
-                timer_hit = (time.monotonic() - self._last_switch_time) >= self._failback_timeout
-                count_hit = self._active_request_count >= self._failback_request_count
-                if timer_hit or count_hit:
-                    previous_idx = self._active_idx
-                    self._active_idx -= 1
-                    self._last_switch_time = time.monotonic()
-                    self._active_request_count = 0
-                    logger.info(
-                        f"Failback condition met (timer={timer_hit}, count={count_hit}), "
-                        f"switching active credential from {previous_idx} to {self._active_idx}"
-                    )
-            return self._active_idx
+            return self._maybe_failback_locked()
+
+    def _maybe_failback_locked(self) -> int:
+        if self._active_idx > 0:
+            timer_hit = (time.monotonic() - self._last_switch_time) >= self._failback_timeout
+            count_hit = self._active_request_count >= self._failback_request_count
+            if timer_hit or count_hit:
+                previous_idx = self._active_idx
+                self._active_idx -= 1
+                self._generation += 1
+                self._last_switch_time = time.monotonic()
+                self._active_request_count = 0
+                logger.info(
+                    f"Failback condition met (timer={timer_hit}, count={count_hit}), "
+                    f"switching active credential from {previous_idx} to {self._active_idx}"
+                )
+        return self._active_idx
+
+    def begin_request(self) -> tuple[int, int]:
+        """原子读取本次请求的起点与代次，避免回主后又读取旧代次。"""
+        with self._lock:
+            return self._maybe_failback_locked(), self._generation
+
+    def generation_for_attempt(self, idx: int, generation: int) -> int:
+        """当前active的新调用取得新授权，其它候选延续已有失败链的授权。"""
+        with self._lock:
+            return self._generation if idx == self._active_idx else generation
 
     def get_active_index(self) -> int:
         """Return the current active credential index (pure read, no side effects).
@@ -755,7 +770,7 @@ class OrderedCredentialSwitcher:
             ModelErrorKind.UNKNOWN,
         }
 
-    def commit_success(self, idx: int) -> None:
+    def commit_success(self, idx: int, *, generation: int | None = None) -> None:
         """Record that credential ``idx`` successfully served a request.
 
         - If ``idx`` is the current active credential, advance the failback
@@ -764,8 +779,13 @@ class OrderedCredentialSwitcher:
         - If ``idx`` differs (a lower/other-priority credential served the
           request after the active one was unavailable), commit it as the new
           active credential (fast failover) and reset failback timers/counters.
+
+        提供generation时，过期调用既不改active也不计入新一轮回主计数；
+        未提供时维持既有调用方的提交语义。
         """
         with self._lock:
+            if generation is not None and generation != self._generation:
+                return
             if idx == self._active_idx:
                 if self._active_idx > 0:
                     self._active_request_count += 1
@@ -775,5 +795,6 @@ class OrderedCredentialSwitcher:
                 f"switching active credential from {self._active_idx} to {idx}"
             )
             self._active_idx = idx
+            self._generation += 1
             self._last_switch_time = time.monotonic()
             self._active_request_count = 0

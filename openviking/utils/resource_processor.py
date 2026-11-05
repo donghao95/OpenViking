@@ -922,19 +922,41 @@ class ResourceProcessor:
 
                 parse_failures = self._directory_parse_failures(parse_meta)
                 if is_directory_aggregate and parse_failures:
-                    result["status"] = "error"
-                    result["errors"].append(self._incomplete_directory_error(parse_failures))
-                    try:
-                        await self._cleanup_parse_result_artifact(
-                            parse_result, output_store=output_store, viking_fs=viking_fs, ctx=ctx
+                    file_count = parse_meta.get("file_count")
+                    # 只信任访问层明确标记的附件内容失败，不能按扩展名或错误文案猜测。
+                    attachment_only_failures = (
+                        not kwargs.get("strict", False)
+                        and isinstance(file_count, int)
+                        and file_count > 0
+                        and all(
+                            item.get("parser") == "feishu"
+                            and item.get("type") == "file"
+                            and item.get("failure_scope") == "content"
+                            for item in parse_failures
                         )
-                    except Exception as exc:
-                        logger.warning(
-                            "[ResourceProcessor] Failed to clean incomplete directory temp %s: %s",
-                            parse_result.temp_dir_path,
-                            exc,
-                        )
-                    return result
+                    )
+                    if not attachment_only_failures:
+                        result["status"] = "error"
+                        result["errors"].append(self._incomplete_directory_error(parse_failures))
+                        try:
+                            await self._cleanup_parse_result_artifact(
+                                parse_result,
+                                output_store=output_store,
+                                viking_fs=viking_fs,
+                                ctx=ctx,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "[ResourceProcessor] Failed to clean incomplete directory temp %s: %s",
+                                parse_result.temp_dir_path,
+                                exc,
+                            )
+                        return result
+                    result.setdefault("warnings", []).extend(parse_result.warnings or [])
+                    result["warnings"].append(
+                        "Failed Feishu file attachments were excluded; successfully parsed "
+                        "content was imported. " + self._incomplete_directory_error(parse_failures)
+                    )
 
                 if parse_result.warnings and kwargs.get("strict", False):
                     result.setdefault("warnings", []).extend(parse_result.warnings)

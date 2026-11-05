@@ -22,7 +22,7 @@ class WatchRuntime:
     LEADER_TTL = 45.0
     DUE_BATCH = 100
     TASK_MISSING_GRACE = 3600.0
-    RUN_TIMEOUT = 10800.0
+    RUN_TIMEOUT = 86400.0
 
     def __init__(
         self,

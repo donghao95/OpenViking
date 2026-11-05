@@ -254,6 +254,15 @@ class DirectoryParser(BaseParser):
                 f"Skipped Feishu Drive item {item['path']}: {item.get('reason', 'unknown error')}"
                 for item in source_skipped_items
             )
+            # 只接受访问层显式分类；不根据错误文案或文件名推断“不支持”。
+            source_unsupported_items = [
+                item for item in source_skipped_items if item["status"] == "unsupported"
+            ]
+            source_skipped_items = [
+                item for item in source_skipped_items if item["status"] != "unsupported"
+            ]
+            if source_unsupported_items and kwargs.get("strict", False):
+                raise InvalidArgumentError("Unsupported Feishu document type in strict import")
 
             file_jobs: List[Dict[str, Any]] = []
             understanding_jobs: List[Dict[str, Any]] = []
@@ -371,7 +380,7 @@ class DirectoryParser(BaseParser):
                 result.meta["total_processable"] = 0
                 result.meta["processed_files"] = []
                 result.meta["failed_files"] = source_skipped_items
-                result.meta["unsupported_files"] = []
+                result.meta["unsupported_files"] = source_unsupported_items
                 result.meta["skipped_files"] = self._parse_skipped(scan_result.skipped)
                 keep_temp = True
                 return result
@@ -501,7 +510,7 @@ class DirectoryParser(BaseParser):
                 failed_files.extend(self._nested_failed_files(cf, parser_name, detail))
 
             # Collect unsupported files from scan result
-            unsupported_files = [
+            unsupported_files = source_unsupported_items + [
                 {
                     "path": uf.rel_path,
                     "status": "unsupported",
@@ -696,16 +705,22 @@ class DirectoryParser(BaseParser):
                 pass
             display_path = display_path.replace("\\", "/")
 
-            normalized.append(
-                {
-                    "path": display_path,
-                    "parser": "feishu",
-                    "status": "failed",
-                    "type": str(item.get("type") or ""),
-                    "token": str(item.get("token") or ""),
-                    "reason": str(item.get("reason") or "unknown error"),
-                }
-            )
+            entry = {
+                "path": display_path,
+                "parser": "feishu",
+                "status": "failed",
+                "type": str(item.get("type") or ""),
+                "token": str(item.get("token") or ""),
+                "reason": str(item.get("reason") or "unknown error"),
+            }
+            if "failure_scope" in item:
+                entry["failure_scope"] = str(item["failure_scope"] or "")
+            if item.get("status") == "unsupported" and item.get("unsupported_type"):
+                entry["status"] = "unsupported"
+                entry["unsupported_type"] = str(item["unsupported_type"])
+            if item.get("wiki_node_token"):
+                entry["wiki_node_token"] = str(item["wiki_node_token"])
+            normalized.append(entry)
         return normalized
 
     @staticmethod
