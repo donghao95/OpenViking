@@ -70,6 +70,14 @@ def test_ci_plan_keeps_marketplace_checks():
     assert not selection["deps_changed"]
 
 
+@pytest.mark.parametrize("full", [False, True])
+def test_server_ci_targets_vm226_linux_amd64(full):
+    plan = runpy.run_path(str(REPO_ROOT / ".github/scripts/ci_plan.py"))["plan"]
+    selection = plan(["crates/ragfs/src/lib.rs", ".github/workflows/api_test.yml"], full=full)
+    assert selection["wheel_os"] == ["ubuntu-24.04"]
+    assert selection["deps_changed"] and selection["api_changed"] and selection["cuvs_changed"]
+
+
 def test_build_workflow_smoke_tests_windows_wheel_engine_import():
     build_workflow = _read_text(".github/workflows/_build.yml")
 

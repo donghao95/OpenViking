@@ -78,6 +78,10 @@ jobs:
         env:
           REDIS_URL: redis://127.0.0.1:6379
         run: cargo test --locked --release -p ragfs --lib plugins::queuefs --features cache
+      - name: 验证上游路径锁与时钟修复
+        env:
+          REDIS_URL: redis://127.0.0.1:6379
+        run: cargo test --locked --release -p ragfs --lib lock:: --features cache
       - name: Pack stable-ABI runtime
         run: uv run --no-sync python .github/scripts/native_bundle.py pack runtime.tar.gz
       - uses: actions/upload-artifact@v7
@@ -118,8 +122,42 @@ jobs:
           tests/storage/test_image_embedding_fallback.py
           tests/storage/test_collection_schemas.py
           tests/test_session_task_tracking.py
+          tests/test_task_tracker.py
+          tests/service/test_task_work_contract.py
+          tests/service/test_task_queue_middleware.py
+          tests/service/test_file_work_restart_failures.py
+          tests/storage/test_session_commit_processor_identity.py
+          tests/server/test_add_locations.py
+          tests/server/test_api_key_manager.py
       - name: 对照积压规模与恢复内存峰值
         run: uv run --no-sync python tests/storage/queue_recovery_memory.py
+
+  deployment-runtime:
+    needs: native-runtime
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: astral-sh/setup-uv@v7
+      - uses: ./.github/actions/native-runtime
+        with:
+          artifact: native-runtime-linux-x64-cp310-abi3
+      - name: 打包 226 运行依赖与预加载语法库
+        timeout-minutes: 8
+        run: |
+          uv pip install pip
+          uv run --no-sync python .github/scripts/pack_deployment_runtime.py
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-amd64-deployment-extras
+          path: .cache/deployment-runtime/
+          if-no-files-found: error
+          retention-days: 1
 
   cuvs-tests:
     # Preserve the caller ID and _test_lite job name: the required check context
