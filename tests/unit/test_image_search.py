@@ -1,6 +1,7 @@
 import base64
 import io
 
+import pytest
 from PIL import Image
 
 from openviking.models.embedder.base import DenseEmbedderBase, EmbedResult
@@ -9,6 +10,7 @@ from openviking.utils.image_search import (
     image_bytes_to_data_uri,
     image_bytes_to_model_data_uri,
     normalize_client_image_input,
+    prepare_image_bytes_for_model,
 )
 from openviking_cli.utils.config.parser_config import ImageConfig
 
@@ -69,3 +71,26 @@ def test_model_image_input_downsamples_jpeg_incompatible_modes():
     with Image.open(io.BytesIO(base64.b64decode(encoded))) as img:
         assert img.mode == "RGB"
         assert max(img.size) <= 64
+
+
+@pytest.mark.parametrize("image_format", ["TIFF", "BMP"])
+def test_small_unsupported_model_images_are_normalized_without_changing_source(image_format):
+    source = io.BytesIO()
+    Image.new("RGB", (16, 12), color="red").save(source, format=image_format)
+    original = source.getvalue()
+
+    data_uri = image_bytes_to_model_data_uri(original, "attachment.png")
+    assert data_uri.startswith("data:image/jpeg;base64,")
+    with Image.open(io.BytesIO(base64.b64decode(data_uri.split(",", 1)[1]))) as image:
+        assert image.format == "JPEG"
+        assert image.size == (16, 12)
+    with Image.open(io.BytesIO(original)) as image:
+        assert image.format == image_format
+
+
+def test_small_supported_model_image_keeps_original_bytes():
+    source = io.BytesIO()
+    Image.new("RGBA", (16, 12), color=(255, 0, 0, 128)).save(source, format="PNG")
+    original = source.getvalue()
+
+    assert prepare_image_bytes_for_model(original) == original

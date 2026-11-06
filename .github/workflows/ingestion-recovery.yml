@@ -1,0 +1,52 @@
+name: Ingestion recovery regressions
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - openviking/privacy/**
+      - openviking/concurrency.py
+      - openviking/utils/image_search.py
+      - tests/unit/test_privacy_sanitizer.py
+      - tests/unit/test_image_search.py
+      - .github/workflows/ingestion-recovery.yml
+
+permissions:
+  contents: read
+
+jobs:
+  regressions:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: astral-sh/setup-uv@v7
+      - uses: ./.github/actions/native-runtime
+      - name: 使用隔离配置执行采集恢复回归
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          config = {
+              "storage": {"workspace": os.environ["RUNNER_TEMP"] + "/ov-regression-data"},
+              "embedding": {"dense": {
+                  "provider": "openai", "model": "synthetic", "api_key": "synthetic",
+                  "dimension": 8, "api_base": "http://127.0.0.1:1/v1",
+              }},
+              "vlm": {"provider": "openai", "model": "synthetic", "api_key": "synthetic",
+                      "api_base": "http://127.0.0.1:1/v1", "max_retries": 0},
+          }
+          path = Path(os.environ["RUNNER_TEMP"]) / "ov-regression.conf"
+          path.write_text(json.dumps(config))
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              env.write(f"OPENVIKING_CONFIG_FILE={path}\n")
+          PY
+      - run: >-
+          uv run --no-sync pytest --noconftest -q -o addopts=''
+          tests/unit/test_privacy_sanitizer.py tests/unit/test_image_search.py

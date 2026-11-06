@@ -4,11 +4,11 @@
 
 from __future__ import annotations
 
-import asyncio
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
 
+from openviking.concurrency import AsyncSemaphore
 from openviking.privacy.reference import build_privacy_field_reference
 from openviking.pyagfs import get_privacy_matcher_class
 from openviking.server.identity import RequestContext
@@ -69,7 +69,7 @@ class PrivacySanitizer:
         matcher_class: Any = get_privacy_matcher_class()
         self._matcher_class = matcher_class
         self._cache: dict[tuple[str, str, int, bool], tuple[float, Any]] = {}
-        self._cache_lock = asyncio.Lock()
+        self._cache_lock = AsyncSemaphore()
 
     @property
     def max_content_bytes(self) -> int:
@@ -205,10 +205,7 @@ class PrivacySanitizer:
                     # sensitivity from field names. Very short values are not
                     # safe for global substring replacement because ordinary
                     # prose would produce excessive false positives.
-                    if (
-                        not isinstance(value, str)
-                        or len(value) < MIN_PROTECTED_VALUE_CHARS
-                    ):
+                    if not isinstance(value, str) or len(value) < MIN_PROTECTED_VALUE_CHARS:
                         continue
                     reference = build_privacy_field_reference(
                         ctx.user.user_id,

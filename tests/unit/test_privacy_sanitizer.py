@@ -44,6 +44,31 @@ def _ctx(user_id="alice"):
     return RequestContext(user=UserIdentifier("account-a", user_id), role=Role.USER)
 
 
+def test_sanitizer_rebuilds_under_contention_across_event_loops():
+    class YieldingCatalog(_PrivacyCatalog):
+        async def list_categories(self, ctx):
+            await asyncio.sleep(0)
+            return await super().list_categories(ctx)
+
+    catalog = YieldingCatalog({"credential": {"service": {"key": "first1"}}})
+    sanitizer = PrivacySanitizer(catalog)
+
+    async def sanitize_batch():
+        return await asyncio.gather(
+            *(sanitizer.sanitize("first1 second2", ctx=_ctx()) for _ in range(3))
+        )
+
+    first = asyncio.run(sanitize_batch())
+    catalog.configs["credential"]["service"]["key"] = "second2"
+    catalog.revision += 1
+    second = asyncio.run(sanitize_batch())
+
+    reference = build_privacy_field_reference("alice", "credential", "service", "key")
+    assert all(result.content == f"{reference} second2" for result in first)
+    assert all(result.content == f"first1 {reference}" for result in second)
+    assert catalog.build_reads == 2
+
+
 def test_privacy_reference_roundtrip_encodes_individual_segments():
     rendered = build_privacy_field_reference("alice", "custom-config", "prod-key", "api/key")
     assert rendered == (
