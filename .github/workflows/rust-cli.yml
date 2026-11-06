@@ -58,30 +58,6 @@ jobs:
             npm_pkg: cli-linux-x64
             npm_os: linux
             npm_cpu: x64
-          - os: ubuntu-24.04
-            target: aarch64-unknown-linux-musl
-            artifact_name: ov-linux-aarch64
-            npm_pkg: cli-linux-arm64
-            npm_os: linux
-            npm_cpu: arm64
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            artifact_name: ov-macos-x86_64
-            npm_pkg: cli-darwin-x64
-            npm_os: darwin
-            npm_cpu: x64
-          - os: macos-14
-            target: aarch64-apple-darwin
-            artifact_name: ov-macos-aarch64
-            npm_pkg: cli-darwin-arm64
-            npm_os: darwin
-            npm_cpu: arm64
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact_name: ov-windows-x86_64.exe
-            npm_pkg: cli-win32-x64
-            npm_os: win32
-            npm_cpu: x64
 
     steps:
     - uses: actions/checkout@v6

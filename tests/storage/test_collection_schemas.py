@@ -1052,7 +1052,7 @@ async def test_embedding_handler_materialize_content_read_failure_is_not_hidden(
         "openviking_cli.utils.config.get_openviking_config",
         lambda: _DummyConfig(embedder),
     )
-    monkeypatch.setattr("openviking.storage.viking_fs.get_viking_fs", lambda: _BrokenFS())
+    monkeypatch.setattr("openviking.storage.viking_fs._base._instance", _BrokenFS())
     handler = TextEmbeddingHandler(_DummyVikingDB())
     msg = EmbeddingMsg(
         "embedding text",
@@ -1102,8 +1102,8 @@ async def test_embedding_handler_materialize_content_uses_preloaded_source(monke
         async def read_file(self, uri, *, ctx):
             raise AssertionError(f"must not reread {uri}")
 
-    monkeypatch.setattr("openviking.storage.viking_fs.get_viking_fs", lambda: _BrokenFS())
-    handler = TextEmbeddingHandler(_DummyVikingDB())
+    monkeypatch.setattr("openviking.storage.viking_fs._base._instance", _BrokenFS())
+    handler = ProductionTextEmbeddingHandler(_DummyVikingDB())
     msg = EmbeddingMsg(
         "embedding text",
         {

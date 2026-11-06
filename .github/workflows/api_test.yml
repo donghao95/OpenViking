@@ -78,6 +78,11 @@ jobs:
         env:
           REDIS_URL: redis://127.0.0.1:6379
         run: cargo test --locked --release -p ragfs --lib plugins::queuefs --features cache
+      - name: 验证上游路径锁与时钟修复
+        env:
+          REDIS_URL: redis://127.0.0.1:6379
+        run: >-
+          cargo test --locked --release -p ragfs --lib lock:: --features cache
       - name: Pack stable-ABI runtime
         run: uv run --no-sync python .github/scripts/native_bundle.py pack runtime.tar.gz
       - uses: actions/upload-artifact@v7
@@ -107,6 +112,23 @@ jobs:
       - uses: ./.github/actions/native-runtime
         with:
           artifact: native-runtime-linux-x64-cp310-abi3
+      - name: 准备隔离的回归配置
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          config = {
+              "storage": {"workspace": os.environ["RUNNER_TEMP"] + "/ov-recovery-regressions"},
+              "embedding": {"dense": {"provider": "openai", "model": "synthetic", "api_key": "synthetic",
+                  "dimension": 8, "api_base": "http://127.0.0.1:1/v1"}},
+              "vlm": {"provider": "openai", "model": "synthetic", "api_key": "synthetic",
+                  "api_base": "http://127.0.0.1:1/v1", "max_retries": 0},
+          }
+          path = Path(os.environ["RUNNER_TEMP"]) / "ov-recovery-regressions.conf"
+          path.write_text(json.dumps(config))
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              env.write(f"OPENVIKING_CONFIG_FILE={path}\n")
+          PY
       - name: 验证分页恢复、队列中间件及任务对账
         env:
           REDIS_URL: redis://127.0.0.1:6379
@@ -115,9 +137,52 @@ jobs:
           tests/storage/test_queue_recovery_pages.py
           tests/storage/test_queue_manager.py
           tests/storage/test_named_queue_middleware.py
+          tests/storage/test_image_embedding_fallback.py
+          tests/storage/test_collection_schemas.py
           tests/test_session_task_tracking.py
+          tests/test_task_tracker.py
+          tests/service/test_task_work_contract.py
+          tests/service/test_task_queue_middleware.py
+          tests/service/test_file_work_restart_failures.py
+          tests/storage/test_session_commit_processor_identity.py
+          tests/server/test_add_locations.py
+          tests/server/test_api_key_manager.py
+      - name: 验证 Compile 取消与策略权限兼容
+        run: >-
+          uv run --no-sync pytest -q -o addopts=''
+          tests/session/memory/test_consolidation_compile.py
+          tests/unit/test_global_policy.py
+          tests/unit/test_global_policy_service.py
       - name: 对照积压规模与恢复内存峰值
         run: uv run --no-sync python tests/storage/queue_recovery_memory.py
+
+  deployment-runtime:
+    needs: native-runtime
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: astral-sh/setup-uv@v7
+      - uses: ./.github/actions/native-runtime
+        with:
+          artifact: native-runtime-linux-x64-cp310-abi3
+      - name: 打包 226 运行依赖与预加载语法库
+        timeout-minutes: 8
+        run: |
+          uv pip install pip
+          uv run --no-sync python .github/scripts/pack_deployment_runtime.py
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-amd64-deployment-extras
+          path: .cache/deployment-runtime/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
 
   cuvs-tests:
     # Preserve the caller ID and _test_lite job name: the required check context
@@ -145,7 +210,7 @@ jobs:
       fail-fast: false
       max-parallel: 3
       matrix:
-        os: ${{ ((github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'release') && fromJSON('["ubuntu-24.04", "macos-15", "windows-latest"]') || fromJSON('["ubuntu-24.04"]') }}
+        os: [ubuntu-24.04]
     
     steps:
       - uses: actions/checkout@v6

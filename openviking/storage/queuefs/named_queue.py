@@ -87,6 +87,7 @@ class NamedQueue:
     """NamedQueue: Operation class for specific named queue, supports status tracking."""
 
     MAX_ERRORS = 100
+    MAX_ERROR_MESSAGE_CHARS = 4096
 
     def __init__(
         self,
@@ -138,13 +139,30 @@ class NamedQueue:
                 self._requeue_count += 1
 
     def _record_error(self, error_msg: str, data: Optional[Dict[str, Any]] = None) -> None:
+        # 错误列表只保留诊断元数据；内联图片的字节数组展开后可能占用数十 MiB。
+        # 持有原始投递会让最近 100 次失败长期占用数 GiB，且与实际消费脱钩。
+        diagnostic: Optional[Dict[str, Any]] = None
+        if data is not None:
+            diagnostic = {"data_omitted": True}
+            message_id = data.get("id")
+            if isinstance(message_id, str):
+                diagnostic["id"] = message_id[:256]
+            timestamp = data.get("timestamp")
+            if isinstance(timestamp, (int, float)):
+                diagnostic["timestamp"] = timestamp
+            payload = data.get("data")
+            if isinstance(payload, (str, bytes, list, dict)):
+                diagnostic["data_type"] = type(payload).__name__[:32]
+                diagnostic["data_length"] = len(payload)
+        if error_msg and len(error_msg) > self.MAX_ERROR_MESSAGE_CHARS:
+            error_msg = error_msg[: self.MAX_ERROR_MESSAGE_CHARS - 3] + "..."
         with self._lock:
             self._error_count += 1
             self._errors.append(
                 QueueError(
                     timestamp=datetime.now(),
                     message=error_msg,
-                    data=data,
+                    data=diagnostic,
                 )
             )
             if len(self._errors) > self.MAX_ERRORS:

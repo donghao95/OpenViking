@@ -86,6 +86,10 @@ class TestFsCp:
                     resources = found.json().get("result", {}).get("resources", [])
                     assert any(item.get("uri") == uri for item in resources), found.text
 
+            # 复制完成后仍可能有父目录刷新，先等其释放路径租约。
+            settled = api_client.system_wait()
+            assert settled.status_code == 200, settled.text
+            assert settled.json().get("status") == "ok", settled.text
             assert api_client.fs_rm(source).status_code == 200
             assert api_client.fs_read(target).status_code == 200
         finally:
