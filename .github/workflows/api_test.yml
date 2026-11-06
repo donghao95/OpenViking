@@ -81,7 +81,8 @@ jobs:
       - name: 验证上游路径锁与时钟修复
         env:
           REDIS_URL: redis://127.0.0.1:6379
-        run: cargo test --locked --release -p ragfs --lib lock:: --features cache
+        run: >-
+          cargo test --locked --release -p ragfs --lib lock:: --features cache
       - name: Pack stable-ABI runtime
         run: uv run --no-sync python .github/scripts/native_bundle.py pack runtime.tar.gz
       - uses: actions/upload-artifact@v7
