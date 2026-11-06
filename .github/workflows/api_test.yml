@@ -130,6 +130,12 @@ jobs:
           tests/storage/test_session_commit_processor_identity.py
           tests/server/test_add_locations.py
           tests/server/test_api_key_manager.py
+      - name: 验证 Compile 取消与策略权限兼容
+        run: >-
+          uv run --no-sync pytest -q -o addopts=''
+          tests/session/memory/test_consolidation_compile.py
+          tests/unit/test_global_policy.py
+          tests/unit/test_global_policy_service.py
       - name: 对照积压规模与恢复内存峰值
         run: uv run --no-sync python tests/storage/queue_recovery_memory.py
 

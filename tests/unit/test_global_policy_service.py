@@ -206,6 +206,8 @@ def test_unreadable_policy_is_not_cached_and_retries():
 
 def test_fifo_eviction_drops_the_oldest_entry_and_logs(monkeypatch, caplog):
     monkeypatch.setattr(global_policy, "POLICY_CACHE_MAX_ENTRIES", 2)
+    # 本测试直接挂接捕获器，禁止再经 root handler 捕获同一条日志。
+    monkeypatch.setattr(global_policy.LOGGER, "propagate", False)
     fs = _FakeVikingFS(
         {
             _path(user="alice"): _POLICY,
