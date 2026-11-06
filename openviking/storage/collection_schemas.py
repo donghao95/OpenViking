@@ -650,7 +650,7 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                 images.append(prepare_image_bytes_for_model(raw, config=image_config))
             else:
                 images.append(ref)
-        # 沿用该账户的视觉模型及并发限制；失败或空响应不能冒充成功摘要。
+        # 调用占用现有 Embedding 工作槽；失败或空响应不能冒充成功摘要。
         response = await asyncio.wait_for(
             vlm.get_vision_completion_async(
                 prompt=render_prompt("parsing.image_summary", {"context": "No additional context"}),

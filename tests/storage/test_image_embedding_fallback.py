@@ -14,6 +14,7 @@ from openviking.storage.collection_schemas import TextEmbeddingHandler
 from openviking.storage.index_action import IndexAction
 from openviking.storage.queuefs.embedding_msg import EmbeddingMsg
 from openviking.storage.queuefs.process_result import ProcessOutcome
+from openviking_cli.utils.config.parser_config import ImageConfig
 
 
 class Embedder:
@@ -32,6 +33,10 @@ class Embedder:
 
 @pytest.fixture
 def setup(monkeypatch):
+    monkeypatch.setattr(
+        "openviking_cli.utils.config.get_openviking_config",
+        lambda: SimpleNamespace(image=ImageConfig()),
+    )
     vlm = SimpleNamespace(
         get_vision_completion_async=AsyncMock(return_value="synthetic image caption")
     )
