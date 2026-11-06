@@ -39,12 +39,13 @@ def _prepare_image_bytes_for_model(
         with Image.open(io.BytesIO(content)) as img:
             width, height = img.size
             image_config = config or ImageConfig()
-            if not is_large_image_by_size(
+            large_image = is_large_image_by_size(
                 file_size_bytes=len(content),
                 width=width,
                 height=height,
                 config=image_config,
-            ):
+            )
+            if not large_image and img.format in {"JPEG", "PNG", "WEBP", "GIF"}:
                 return content, False
 
             preview = img.convert("RGB")
@@ -66,7 +67,7 @@ def prepare_image_bytes_for_model(
     data: bytes | bytearray | memoryview,
     config: ImageConfig | None = None,
 ) -> bytes:
-    """Downsample oversized image bytes for model requests without changing storage."""
+    """Normalize unsupported formats and oversized images without changing storage."""
     model_bytes, _ = _prepare_image_bytes_for_model(data, config=config)
     return model_bytes
 
