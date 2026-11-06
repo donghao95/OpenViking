@@ -409,6 +409,28 @@ jobs:
         print(f"Bundled Web Studio index {studio_index}")
         PY
 
+    - name: 记录 Linux 制品来源和校验值
+      shell: bash
+      run: |
+        "$PYTHON_BIN" - <<'PY'
+        import hashlib, json, os, platform, subprocess
+        from pathlib import Path
+        manifest = {
+            "sha": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+            "tree": subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], text=True).strip(),
+            "platform": "linux-" + platform.machine(),
+            "libc": os.confstr("CS_GNU_LIBC_VERSION"),
+            "files": {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in Path("dist").glob("*.whl")},
+        }
+        assert manifest["files"]
+        Path("wheel-provenance.json").write_text(json.dumps(manifest, indent=2))
+        PY
+    - uses: actions/upload-artifact@v7
+      with:
+        name: wheel-provenance-linux-${{ matrix.arch }}-${{ matrix.python-version }}
+        path: wheel-provenance.json
+        if-no-files-found: error
+
     - name: Store the distribution packages
       uses: actions/upload-artifact@v7
       with:

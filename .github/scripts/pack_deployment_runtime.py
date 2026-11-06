@@ -5,13 +5,16 @@ import importlib.metadata
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import tarfile
+import tempfile
 from pathlib import Path
 from typing import get_args
 
 import tomllib
+from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name, parse_wheel_filename
 
 BASELINE = "2ace1f2965a1e85bea198b243c5277b9bf3cf43b"
@@ -22,6 +25,43 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def parse_runtime_pins(exported, environment=None):
+    pins = {}
+    for line in exported.splitlines():
+        line = line.strip().rstrip("\\").strip()
+        if not line or line.startswith(("#", "--")):
+            continue
+        requirement = Requirement(line)
+        if requirement.marker is not None and not requirement.marker.evaluate(environment):
+            continue
+        versions = [v.version for v in requirement.specifier if v.operator == "=="]
+        if len(versions) != 1:
+            raise ValueError("导出的运行依赖必须固定版本：" + line)
+        name = str(canonicalize_name(requirement.name))
+        if name in pins and pins[name] != versions[0]:
+            raise ValueError("同一运行环境解析出多个版本：" + name)
+        pins[name] = versions[0]
+    return pins
+
+
+def export_runtime(project, dockerfile, environment=None):
+    extras = sorted(set(re.findall(r"--extra ([a-z0-9-]+)", dockerfile)))
+    exported = subprocess.check_output(
+        [
+            "uv",
+            "export",
+            "--frozen",
+            "--project",
+            str(project),
+            "--no-dev",
+            "--no-emit-project",
+            *[arg for name in extras for arg in ("--extra", name)],
+        ],
+        text=True,
+    )
+    return parse_runtime_pins(exported, environment)
+
+
 def main():
     if (
         platform.system() != "Linux"
@@ -29,13 +69,23 @@ def main():
         or sys.version_info[:2] != (3, 13)
     ):
         raise RuntimeError("部署依赖必须在 Linux amd64 / Python 3.13 上准备")
-    old = tomllib.loads(subprocess.check_output(["git", "show", BASELINE + ":uv.lock"]).decode())
     new = tomllib.loads(Path("uv.lock").read_text())
-    previous = {p["name"]: p.get("version") for p in old["package"]}
+    # 先分别解析基线和目标的实际运行闭包，包含新激活的传递依赖及环境标记。
+    with tempfile.TemporaryDirectory(prefix="ov-runtime-baseline-") as folder:
+        baseline = Path(folder)
+        for name in ["pyproject.toml", "uv.lock", "Dockerfile", "README.md"]:
+            (baseline / name).write_bytes(
+                subprocess.check_output(["git", "show", BASELINE + ":" + name])
+            )
+        previous = export_runtime(baseline, (baseline / "Dockerfile").read_text())
+    desired = export_runtime(Path.cwd(), Path("Dockerfile").read_text())
     changed = {
         p["name"]: p
         for p in new["package"]
-        if p.get("version") != previous.get(p["name"]) and "registry" in p.get("source", {})
+        if p["name"] in desired
+        and p.get("version") == desired[p["name"]]
+        and p.get("version") != previous.get(p["name"])
+        and "registry" in p.get("source", {})
     }
     output = Path(".cache/deployment-runtime")
     output.mkdir(parents=True, exist_ok=False)
@@ -65,6 +115,25 @@ def main():
         allowed = {v["hash"] for v in package.get("wheels", [])}
         assert "sha256:" + digest(wheel) in allowed, "依赖制品不匹配 uv.lock"
     assert len(list(wheels.glob("*.whl"))) == len(requirements)
+    # 旧运行镜像可能没有 pip；部署时只从这个工具 wheel 临时启动安装器。
+    tools = output / "tools"
+    tools.mkdir()
+    installer_version = importlib.metadata.version("pip")
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "download",
+            "--no-deps",
+            "--only-binary=:all:",
+            "--dest",
+            str(tools),
+            "pip==" + installer_version,
+        ],
+        check=True,
+        timeout=120,
+    )
 
     # 与上游 Dockerfile 保持相同的全量预加载门禁；缺少任何语法即失败。
     from tree_sitter_language_pack import (
@@ -102,6 +171,7 @@ def main():
         "platform": "linux-amd64",
         "python": "3.13",
         "dependencies": requirements,
+        "installer_version": installer_version,
         "grammar_package_version": importlib.metadata.version("tree-sitter-language-pack"),
         "grammar_files": grammar_files,
         "files": {str(p.relative_to(output)): digest(p) for p in output.rglob("*") if p.is_file()},
