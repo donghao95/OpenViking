@@ -3,7 +3,9 @@
 """Queue middleware ordering and transport compatibility."""
 
 import asyncio
+import gc
 import json
+import weakref
 from unittest.mock import AsyncMock
 
 import pytest
@@ -31,6 +33,54 @@ def transport(monkeypatch):
 class Handler(DequeueHandlerBase):
     async def on_dequeue(self, data):
         return ProcessResult.success(data)
+
+
+@pytest.mark.parametrize("raises", [False, True])
+async def test_failed_deliveries_release_large_payloads(transport, raises):
+    class Payload(list):
+        pass
+
+    class FailingHandler(DequeueHandlerBase):
+        async def on_dequeue(self, data):
+            if raises:
+                raise RuntimeError("synthetic failure")
+            return ProcessResult.failed("synthetic failure")
+
+    queue = NamedQueue(object(), "/queue", "Embedding", dequeue_handler=FailingHandler())
+    references = []
+    for i in range(queue.MAX_ERRORS + 5):
+        payload = Payload([65] * (128 * 1024))
+        references.append(weakref.ref(payload))
+        delivery = {"id": str(i), "timestamp": 123.0, "data": payload}
+        try:
+            await queue.process_dequeued(delivery)
+            assert not raises
+        except RuntimeError:
+            assert raises
+        assert delivery["data"] is payload
+        del delivery, payload
+    gc.collect()
+
+    assert all(ref() is None for ref in references)
+    assert queue._error_count == queue.MAX_ERRORS + 5
+    assert len(queue._errors) == queue.MAX_ERRORS
+    assert queue._errors[-1].data == {
+        "id": str(queue.MAX_ERRORS + 4),
+        "timestamp": 123.0,
+        "data_omitted": True,
+        "data_type": "Payload",
+        "data_length": 128 * 1024,
+    }
+    transport.write.assert_not_awaited()
+
+
+def test_error_diagnostics_bound_large_identifiers_and_messages(transport):
+    queue = NamedQueue(object(), "/queue", "Embedding")
+    queue._record_error("x" * 100_000, {"id": "y" * 100_000, "data": "sensitive payload"})
+    error = queue._errors[-1]
+    assert len(error.message) == queue.MAX_ERROR_MESSAGE_CHARS
+    assert len(error.data["id"]) == 256
+    assert "sensitive payload" not in json.dumps(error.data)
 
 
 @pytest.mark.parametrize("operation", ["enqueue", "process", "ack", "clear"])
