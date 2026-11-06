@@ -1,11 +1,11 @@
-use super::backend::{Message, QueueState, StoredMessage};
+use super::backend::{Message, MessagePage, MessagePageRequest, QueueState, StoredMessage};
 use super::cache_protocol::{
     heartbeat_key, instance_key_prefix, last_enqueue_time_from_pending_payloads, queue_key_prefix,
     queue_names_key, recovery_leader_key, unix_secs, QueueKeys, ACK_SCRIPT,
     ACQUIRE_RECOVERY_LEADER_SCRIPT, CLEAR_SCRIPT, CREATE_QUEUE_SCRIPT, DEQUEUE_SCRIPT,
-    ENQUEUE_SCRIPT, HEARTBEAT_INTERVAL_SECS, HEARTBEAT_TTL_SECS, LIST_UNACKED_SCRIPT, PEEK_SCRIPT,
-    RECOVERY_INTERVAL_SECS, RECOVERY_LEADER_TTL_SECS, RECOVER_STALE_SCRIPT,
-    RELEASE_RECOVERY_LEADER_SCRIPT, REMOVE_QUEUE_SCRIPT, STATUS_SCRIPT,
+    ENQUEUE_SCRIPT, HEARTBEAT_INTERVAL_SECS, HEARTBEAT_TTL_SECS, LIST_UNACKED_PAGE_SCRIPT,
+    LIST_UNACKED_SCRIPT, PEEK_SCRIPT, RECOVERY_INTERVAL_SECS, RECOVERY_LEADER_TTL_SECS,
+    RECOVER_STALE_SCRIPT, RELEASE_RECOVERY_LEADER_SCRIPT, REMOVE_QUEUE_SCRIPT, STATUS_SCRIPT,
 };
 use crate::cache_runtime::{
     CacheError, CacheOperation, CacheRuntime, Expiration, ScriptDefinition, ScriptRequest,
@@ -27,6 +27,7 @@ const DEQUEUE_ID: &str = "queuefs.dequeue.v1";
 const PEEK_ID: &str = "queuefs.peek.v1";
 const STATUS_ID: &str = "queuefs.status.v1";
 const LIST_UNACKED_ID: &str = "queuefs.list_unacked.v1";
+const LIST_UNACKED_PAGE_ID: &str = "queuefs.list_unacked_page.v1";
 const ACK_ID: &str = "queuefs.ack.v1";
 const CLEAR_ID: &str = "queuefs.clear.v1";
 const RECOVER_STALE_ID: &str = "queuefs.recover_stale.v1";
@@ -34,6 +35,10 @@ const ACQUIRE_RECOVERY_LEADER_ID: &str = "queuefs.acquire_recovery_leader.v1";
 const RELEASE_RECOVERY_LEADER_ID: &str = "queuefs.release_recovery_leader.v1";
 
 const SCRIPT_DEFINITIONS: &[ScriptDefinition] = &[
+    ScriptDefinition {
+        id: LIST_UNACKED_PAGE_ID,
+        redis_lua: LIST_UNACKED_PAGE_SCRIPT,
+    },
     ScriptDefinition {
         id: CREATE_QUEUE_ID,
         redis_lua: CREATE_QUEUE_SCRIPT,
@@ -427,6 +432,41 @@ impl CacheQueueStorage {
         .iter()
         .map(|payload| Self::decode_message(payload))
         .collect()
+    }
+
+    pub(super) async fn list_unacked_page(
+        &self,
+        queue_name: &str,
+        request: &MessagePageRequest,
+    ) -> Result<MessagePage> {
+        self.require_queue(queue_name).await?;
+        let keys = QueueKeys::new(&self.key_prefix, queue_name);
+        let values = string_array(
+            self.execute(
+                "list_unacked_page",
+                LIST_UNACKED_PAGE_ID,
+                vec![keys.pending, keys.processing],
+                vec![
+                    bytes(keys.message_prefix),
+                    bytes(request.after.clone().unwrap_or_default()),
+                    bytes(request.through.clone().unwrap_or_default()),
+                    bytes(request.limit.to_string()),
+                    bytes(request.max_bytes.to_string()),
+                ],
+            )
+            .await?,
+        )?;
+        if values.len() < 2 {
+            return Err(Error::internal("invalid queue page response"));
+        }
+        Ok(MessagePage {
+            through: values[0].clone(),
+            next_cursor: (!values[1].is_empty()).then(|| values[1].clone()),
+            messages: values[2..]
+                .iter()
+                .map(|value| Self::decode_message(value))
+                .collect::<Result<Vec<_>>>()?,
+        })
     }
 
     pub(super) async fn clear(&self, queue_name: &str) -> Result<()> {

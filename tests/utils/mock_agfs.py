@@ -136,6 +136,11 @@ class MockLocalAGFS:
         return p.read_bytes()
 
     def read(self, path, ctx=None, **kwargs):
+        control = str(path).split("?", 1)[0]
+        if control.startswith("/queue/") and control.endswith("/messages_page"):
+            # 域测试不模拟队列消费；启动恢复需要一个明确的空队列视图。
+            if self._resolve(control).parent.is_dir():
+                return b'{"messages":[],"through":"","next_cursor":null}'
         return self.read_file(path, ctx, **kwargs)
 
     def cat(self, path, ctx=None, **kwargs):

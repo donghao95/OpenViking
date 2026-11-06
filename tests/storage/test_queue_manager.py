@@ -354,7 +354,9 @@ async def test_bootstrap_restores_legacy_messages_into_store(transport):
         "id": "legacy-message",
         "data": json.dumps({"task_id": "task", "account_id": "account", "user_id": "user"}),
     }
-    transport.read.return_value = json.dumps([message]).encode()
+    transport.read.return_value = json.dumps(
+        {"messages": [message], "through": "1", "next_cursor": None}
+    ).encode()
     restored_work = []
 
     class Tracker:
@@ -387,7 +389,9 @@ async def test_bootstrap_restores_task_owner_from_cross_user_child_work(transpor
             }
         ),
     }
-    transport.read.return_value = json.dumps([message]).encode()
+    transport.read.return_value = json.dumps(
+        {"messages": [message], "through": "1", "next_cursor": None}
+    ).encode()
     restored_work = []
 
     class Tracker:

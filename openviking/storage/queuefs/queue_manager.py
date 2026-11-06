@@ -174,11 +174,11 @@ class QueueManager:
         if tracker.work_recovery_mode is WorkRecoveryMode.DURABLE_STORE:
             return []
 
-        snapshots = {name: await queue.snapshot() for name, queue in self._queues.items()}
         owners: Dict[str, tuple[str, str]] = {}
-        for queue_name, messages in snapshots.items():
-            for message in messages:
+        for queue_name, queue in self._queues.items():
+            async for message in queue.iter_snapshot():
                 metadata = extract_task_metadata(message)
+                del message
                 if metadata is None or not metadata.account_id or not metadata.user_id:
                     continue
                 owners[metadata.task_id] = (metadata.account_id, metadata.user_id)
@@ -200,8 +200,9 @@ class QueueManager:
             return []
         tasks = []
         seen: set[tuple[str, str, str]] = set()
-        for message in await queue.snapshot():
+        async for message in queue.iter_snapshot():
             metadata = extract_task_metadata(message)
+            del message
             if metadata is None or not metadata.account_id or not metadata.user_id:
                 continue
             key = (metadata.task_id, metadata.account_id, metadata.user_id)
