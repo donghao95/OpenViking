@@ -8,6 +8,7 @@ similar to how init_viking_fs encapsulates VikingFS initialization.
 """
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
@@ -18,7 +19,11 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from openviking.core.context import ContextType, ResourceContentType
-from openviking.models.embedder.base import embed_compat
+from openviking.models.embedder.base import (
+    embed_compat,
+    embedder_supports_multimodal,
+    extract_text_from_content,
+)
 from openviking.models.model_error import UNKNOWN_BRIEF, ModelErrorKind, brief_for, model_error_kind
 from openviking.server.identity import RequestContext, Role
 from openviking.service.task_domain import make_work_error
@@ -54,6 +59,7 @@ from openviking_cli.utils.config.open_viking_config import OpenVikingConfig
 
 logger = get_logger(__name__)
 EMBEDDING_META_MARKER = "\n\n[openviking.embedding]\n"
+IMAGE_EMBEDDING_CAPTION_TIMEOUT_SECONDS = 120
 
 _EMBEDDING_COMPATIBILITY_KEYS = ("provider", "model", "dimension", "model_identity")
 
@@ -606,6 +612,59 @@ class TextEmbeddingHandler(DequeueHandlerBase):
         return ProcessResult.failed(message, errors=(detail,))
 
     @staticmethod
+    async def _embedding_input_with_image_fallback(
+        embedding_msg: EmbeddingMsg, embedder: Any, ctx: RequestContext
+    ) -> Any:
+        """为文本向量模型补齐旧图片投递缺失的语义输入，不改写图片原文。"""
+        content = embedding_msg.message
+        if not isinstance(content, list) or extract_text_from_content(content).strip():
+            return content
+        image_refs = [
+            part.get("image_url", {}).get("url")
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "image_url"
+        ]
+        if not image_refs or await embedder_supports_multimodal(embedder):
+            return content
+        if any(not isinstance(ref, str) or not ref for ref in image_refs):
+            raise ValueError("Image embedding requires nonempty image references")
+        abstract = embedding_msg.context_data.get("abstract")
+        if isinstance(abstract, str) and abstract.strip():
+            return abstract
+
+        from openviking.prompts import render_prompt
+        from openviking.storage.viking_fs import get_viking_fs
+        from openviking.utils.embedding_utils import _truncate_abstract_bytes
+        from openviking.utils.image_search import prepare_image_bytes_for_model
+        from openviking_cli.utils.config import get_openviking_config
+
+        resolver = getattr(get_viking_fs(), "_vlm_resolver", None)
+        if resolver is None:
+            raise RuntimeError("Image embedding fallback requires an account VLM resolver")
+        vlm = await resolver.get_vlm(ctx.account_id)
+        image_config = getattr(get_openviking_config(), "image", None)
+        images = []
+        for ref in image_refs:
+            if ref.startswith("data:image/") and ";base64," in ref:
+                raw = base64.b64decode(ref.split(",", 1)[1], validate=True)
+                images.append(prepare_image_bytes_for_model(raw, config=image_config))
+            else:
+                images.append(ref)
+        # 沿用该账户的视觉模型及并发限制；失败或空响应不能冒充成功摘要。
+        response = await asyncio.wait_for(
+            vlm.get_vision_completion_async(
+                prompt=render_prompt("parsing.image_summary", {"context": "No additional context"}),
+                images=images,
+            ),
+            timeout=IMAGE_EMBEDDING_CAPTION_TIMEOUT_SECONDS,
+        )
+        if not isinstance(response, str) or not response.strip():
+            raise ValueError("Image embedding fallback produced an empty caption")
+        caption = _truncate_abstract_bytes(response.strip())
+        embedding_msg.context_data["abstract"] = caption
+        return caption
+
+    @staticmethod
     async def _materialize_content(
         embedding_msg: EmbeddingMsg,
         ctx: RequestContext,
@@ -764,9 +823,18 @@ class TextEmbeddingHandler(DequeueHandlerBase):
 
                         _embed_t0 = _time.monotonic()
                         with bind_ingestion_source_type(embedding_msg.source_type):
+                            embedding_input = await self._embedding_input_with_image_fallback(
+                                embedding_msg, embedder, ctx
+                            )
+                            if inserted_data.get("abstract") != embedding_msg.context_data.get(
+                                "abstract"
+                            ):
+                                inserted_data["abstract"] = embedding_msg.context_data.get(
+                                    "abstract", ""
+                                )
                             result = await embed_compat(
                                 embedder,
-                                embedding_msg.message,
+                                embedding_input,
                                 is_query=False,
                             )
                         self._breaker_open_last_log_at.pop(account_id, None)

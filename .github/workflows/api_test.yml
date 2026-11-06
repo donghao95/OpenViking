@@ -115,6 +115,8 @@ jobs:
           tests/storage/test_queue_recovery_pages.py
           tests/storage/test_queue_manager.py
           tests/storage/test_named_queue_middleware.py
+          tests/storage/test_image_embedding_fallback.py
+          tests/storage/test_collection_schemas.py
           tests/test_session_task_tracking.py
       - name: 对照积压规模与恢复内存峰值
         run: uv run --no-sync python tests/storage/queue_recovery_memory.py
