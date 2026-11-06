@@ -8,6 +8,9 @@
 //! - `/queue_name/size` - Read from this file to get the current queue size
 //! - `/queue_name/status` - Read pending and processing message counts
 //! - `/queue_name/messages` - Read all unacknowledged messages without changing queue state
+//! - `/queue_name/messages_page?after=...&through=...&limit=32&max_bytes=8388608`
+//!   按不透明游标读取一页未确认消息；首轮返回固定上界，后续请求必须带回。
+//!   单条超出字节预算时独占一页。分页只读，不改变投递和确认状态。
 //! - `/queue_name/clear` - Write to this file to clear all messages from the queue
 //! - `/queue_name/ack` - Write message ID to this file to acknowledge and delete it
 
@@ -24,7 +27,10 @@ use crate::core::{
     types::{ConfigParameter, FileInfo, PluginConfig, WriteFlag},
 };
 use async_trait::async_trait;
-use backend::{MemoryBackend, Message, QueueBackend, SQLiteQueueBackend, SQLiteQueueOptions};
+use backend::{
+    MemoryBackend, Message, MessagePage, MessagePageRequest, QueueBackend, SQLiteQueueBackend,
+    SQLiteQueueOptions,
+};
 #[cfg(feature = "cache")]
 use cache_backend::CacheQueueStorage;
 use serde::Serialize;
@@ -65,6 +71,10 @@ const CONTROL_FILES: &[ControlFileSpec] = &[
         mode: 0o444,
     },
     ControlFileSpec {
+        name: "messages_page",
+        mode: 0o444,
+    },
+    ControlFileSpec {
         name: "clear",
         mode: 0o222,
     },
@@ -81,6 +91,56 @@ struct QueueMessage {
     data: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     timestamp: Option<f64>,
+}
+
+#[derive(Serialize)]
+struct QueueMessagePage {
+    messages: Vec<QueueMessage>,
+    next_cursor: Option<String>,
+    through: String,
+}
+
+fn parse_page_request(path: &str) -> Result<MessagePageRequest> {
+    let mut request = MessagePageRequest {
+        after: None,
+        through: None,
+        limit: 32,
+        max_bytes: 8 * 1024 * 1024,
+    };
+    let query = path.split_once('?').map(|(_, query)| query).unwrap_or("");
+    let mut seen = std::collections::HashSet::new();
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        if !seen.insert(key.to_string()) {
+            return Err(Error::InvalidOperation(
+                "duplicate queue page parameter".into(),
+            ));
+        }
+        match key.as_ref() {
+            "after" => request.after = Some(value.into_owned()),
+            "through" => request.through = Some(value.into_owned()),
+            "limit" => {
+                request.limit = value
+                    .parse()
+                    .map_err(|_| Error::InvalidOperation("invalid queue page limit".into()))?
+            }
+            "max_bytes" => {
+                request.max_bytes = value
+                    .parse()
+                    .map_err(|_| Error::InvalidOperation("invalid queue page byte budget".into()))?
+            }
+            _ => {
+                return Err(Error::InvalidOperation(
+                    "unknown queue page parameter".into(),
+                ))
+            }
+        }
+    }
+    if !(1..=32).contains(&request.limit) || !(1..=8 * 1024 * 1024).contains(&request.max_bytes) {
+        return Err(Error::InvalidOperation(
+            "queue page budget out of range".into(),
+        ));
+    }
+    Ok(request)
 }
 
 fn queue_message_timestamp(msg: &Message) -> Option<f64> {
@@ -211,6 +271,18 @@ impl QueueStorage {
         }
     }
 
+    async fn list_unacked_page(
+        &self,
+        queue_name: &str,
+        request: &MessagePageRequest,
+    ) -> Result<MessagePage> {
+        match self {
+            Self::Local(backend) => backend.lock().await.list_unacked_page(queue_name, request),
+            #[cfg(feature = "cache")]
+            Self::Cache(storage) => storage.list_unacked_page(queue_name, request).await,
+        }
+    }
+
     async fn clear(&self, queue_name: &str) -> Result<()> {
         match self {
             Self::Local(backend) => backend.lock().await.clear(queue_name),
@@ -301,6 +373,10 @@ impl QueueFileSystem {
 
     /// Parse a queue path into its components
     fn parse_queue_path(path: &str) -> Result<ParsedPath> {
+        let path = match path.split_once('?') {
+            Some((base, _)) if base.ends_with("/messages_page") => base,
+            _ => path,
+        };
         let path = Self::normalize_path(path);
         let path = path.trim_start_matches('/');
 
@@ -379,6 +455,30 @@ impl FileSystem for QueueFileSystem {
             .ok_or_else(|| Error::InvalidOperation("no operation specified".to_string()))?;
 
         match operation.as_str() {
+            "messages_page" => {
+                let request = parse_page_request(path)?;
+                let page = self
+                    .storage
+                    .list_unacked_page(&queue_name, &request)
+                    .await?;
+                let messages = page
+                    .messages
+                    .into_iter()
+                    .map(|message| {
+                        let timestamp = queue_message_timestamp(&message);
+                        QueueMessage {
+                            id: message.id,
+                            data: String::from_utf8_lossy(&message.data).into_owned(),
+                            timestamp,
+                        }
+                    })
+                    .collect();
+                Ok(serde_json::to_vec(&QueueMessagePage {
+                    messages,
+                    next_cursor: page.next_cursor,
+                    through: page.through,
+                })?)
+            }
             "dequeue" => {
                 let Some(msg) = self.storage.dequeue(&queue_name).await? else {
                     return Ok(b"{}".to_vec());
@@ -420,13 +520,13 @@ impl FileSystem for QueueFileSystem {
                     .list_unacked(&queue_name)
                     .await?
                     .into_iter()
-                .map(|msg| {
-                    let timestamp = queue_message_timestamp(&msg);
-                    QueueMessage {
-                        id: msg.id,
-                        data: String::from_utf8_lossy(&msg.data).to_string(),
-                        timestamp,
-                    }
+                    .map(|msg| {
+                        let timestamp = queue_message_timestamp(&msg);
+                        QueueMessage {
+                            id: msg.id,
+                            data: String::from_utf8_lossy(&msg.data).to_string(),
+                            timestamp,
+                        }
                     })
                     .collect::<Vec<_>>();
                 Ok(serde_json::to_vec(&messages)?)
@@ -1056,11 +1156,8 @@ mod tests {
         assert!(entries[0].is_dir);
 
         // Queue directory should list control files
-        let entries = fs
-            .read_dir("/test", None, None, None, None)
-            .await
-            .unwrap();
-        assert_eq!(entries.len(), 8);
+        let entries = fs.read_dir("/test", None, None, None, None).await.unwrap();
+        assert_eq!(entries.len(), 9);
 
         let names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
         assert!(names.contains(&"enqueue".to_string()));
@@ -1219,10 +1316,7 @@ mod tests {
         fs.mkdir("/logs/warnings", 0o755).await.unwrap();
 
         // List /logs should show subdirectories
-        let entries = fs
-            .read_dir("/logs", None, None, None, None)
-            .await
-            .unwrap();
+        let entries = fs.read_dir("/logs", None, None, None, None).await.unwrap();
         assert_eq!(entries.len(), 2);
         let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&"errors"));

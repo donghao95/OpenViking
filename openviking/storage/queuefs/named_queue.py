@@ -9,7 +9,19 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import partial
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, TypeVar, Union
+from typing import (
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    TypeVar,
+    Union,
+)
+from urllib.parse import urlencode
 
 from openviking.pyagfs import AGFSSyncClientProtocol, AsyncAGFSClient
 from openviking.pyagfs.exceptions import AGFSAlreadyExistsError, AGFSNotFoundError
@@ -390,6 +402,41 @@ class NamedQueue:
             content = content.content.decode("utf-8")
         parsed = json.loads(content)
         return parsed if isinstance(parsed, list) else []
+
+    async def iter_snapshot(self) -> AsyncIterator[Dict[str, Any]]:
+        """分批恢复未确认投递；旧绑定不支持时明确失败，禁止退回全量载荷。"""
+        await self._ensure_initialized()
+        params: Dict[str, Any] = {"limit": 32, "max_bytes": 8 * 1024 * 1024}
+        seen: set[str] = set()
+        through = None
+        while True:
+            content = await self._async_agfs.read(f"{self.path}/messages_page?{urlencode(params)}")
+            if hasattr(content, "content"):
+                content = content.content
+            page = json.loads(content)
+            if not isinstance(page, dict) or not isinstance(page.get("messages"), list):
+                raise RuntimeError("队列恢复分页响应无效，请核对原生绑定版本")
+            upper = page.get("through")
+            if not isinstance(upper, str) or (through is not None and upper != through):
+                raise RuntimeError("队列恢复分页上界发生变化")
+            through = upper
+            cursor = page.get("next_cursor")
+            messages = page["messages"]
+            if len(messages) > 32 or any(not isinstance(message, dict) for message in messages):
+                raise RuntimeError("队列恢复分页消息无效")
+            if cursor is not None and (
+                not isinstance(cursor, str) or not cursor or cursor in seen or not messages
+            ):
+                raise RuntimeError("队列恢复分页游标没有前进")
+            for message in messages:
+                yield message
+            # 拉取下一页前释放这一页的完整 JSON 和图片载荷。
+            message = None
+            del messages, page, content
+            if cursor is None:
+                return
+            seen.add(cursor)
+            params.update(after=cursor, through=through)
 
     async def clear(self) -> bool:
         """Clear queue."""

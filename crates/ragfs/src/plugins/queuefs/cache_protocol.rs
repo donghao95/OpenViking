@@ -86,6 +86,44 @@ end
 return {redis.call('LLEN', KEYS[2]), redis.call('ZCARD', KEYS[3])}
 "#;
 
+// 只收集小型消息 ID，再按稳定 ID 游标读取一页载荷，避免 LRANGE 全量载荷。
+pub(super) const LIST_UNACKED_PAGE_SCRIPT: &str = r#"
+local ids = {}
+local seen = {}
+for _, id in ipairs(redis.call('LRANGE', KEYS[1], 0, -1)) do
+    if not seen[id] then table.insert(ids, id); seen[id] = true end
+end
+for _, member in ipairs(redis.call('ZRANGE', KEYS[2], 0, -1)) do
+    local separator = string.find(member, '|', 1, true)
+    if separator then
+        local id = string.sub(member, 1, separator - 1)
+        if not seen[id] then table.insert(ids, id); seen[id] = true end
+    end
+end
+table.sort(ids)
+local through = ARGV[3]
+if through == '' then through = ids[#ids] or '' end
+local result = {through, ''}
+local count = 0
+local bytes = 0
+local cursor = ARGV[2]
+for _, id in ipairs(ids) do
+    if id > ARGV[2] and id <= through then
+        local payload = redis.call('GET', ARGV[1] .. id)
+        if not payload then return redis.error_reply('queuefs payload missing for message ' .. id) end
+        if count > 0 and (count >= tonumber(ARGV[4]) or bytes + #payload > tonumber(ARGV[5])) then
+            result[2] = cursor
+            break
+        end
+        table.insert(result, payload)
+        bytes = bytes + #payload
+        count = count + 1
+        cursor = id
+    end
+end
+return result
+"#;
+
 pub(super) const LIST_UNACKED_SCRIPT: &str = r#"
 local result = {}
 local pending = redis.call('LRANGE', KEYS[1], 0, -1)

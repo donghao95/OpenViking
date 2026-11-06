@@ -47,6 +47,20 @@ pub struct QueueState {
     pub processing: usize,
 }
 
+/// 恢复分页只保留一批载荷；游标和上界由后端解释。
+pub struct MessagePageRequest {
+    pub after: Option<String>,
+    pub through: Option<String>,
+    pub limit: usize,
+    pub max_bytes: usize,
+}
+
+pub struct MessagePage {
+    pub messages: Vec<Message>,
+    pub next_cursor: Option<String>,
+    pub through: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct StoredMessage {
     id: String,
@@ -63,8 +77,7 @@ impl StoredMessage {
             data: msg.data.clone(),
             // Older readers already accept RFC3339 strings; nanoseconds preserve latency accuracy.
             timestamp: Some(serde_json::Value::String(
-                DateTime::<Utc>::from(msg.timestamp)
-                    .to_rfc3339_opts(SecondsFormat::Nanos, true),
+                DateTime::<Utc>::from(msg.timestamp).to_rfc3339_opts(SecondsFormat::Nanos, true),
             )),
         }
     }
@@ -86,27 +99,38 @@ fn deserialize_stored_message_data<'de, D>(
 where
     D: Deserializer<'de>,
 {
-    let value = serde_json::Value::deserialize(deserializer)?;
-    match value {
-        // Legacy queue.db rows stored message bytes as a JSON string.
-        serde_json::Value::String(data) => Ok(data.into_bytes()),
-        // New rows keep arbitrary message bytes lossless as a JSON byte array.
-        serde_json::Value::Array(bytes) => bytes
-            .into_iter()
-            .map(|byte| {
-                byte.as_u64()
-                    .and_then(|value| u8::try_from(value).ok())
-                    .ok_or_else(|| {
-                        serde::de::Error::custom(
-                            "stored queue message data byte must be an integer in 0..=255",
-                        )
-                    })
-            })
-            .collect(),
-        other => Err(serde::de::Error::custom(format!(
-            "stored queue message data must be a string or byte array, got {other}"
-        ))),
+    struct BytesVisitor;
+    impl<'de> serde::de::Visitor<'de> for BytesVisitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a string or array of bytes")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> std::result::Result<Vec<u8>, E> {
+            Ok(value.as_bytes().to_vec())
+        }
+
+        fn visit_string<E: serde::de::Error>(
+            self,
+            value: String,
+        ) -> std::result::Result<Vec<u8>, E> {
+            Ok(value.into_bytes())
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut sequence: A,
+        ) -> std::result::Result<Vec<u8>, A::Error> {
+            // 逐字节解码，避免为图片的每一个字节先分配 serde_json::Value。
+            let mut bytes = Vec::new();
+            while let Some(byte) = sequence.next_element::<u8>()? {
+                bytes.push(byte);
+            }
+            Ok(bytes)
+        }
     }
+    deserializer.deserialize_any(BytesVisitor)
 }
 
 fn parse_stored_timestamp(raw: Option<serde_json::Value>) -> (SystemTime, bool) {
@@ -185,6 +209,12 @@ pub trait QueueBackend: Send + Sync {
 
     /// List every unacknowledged message without changing queue state
     fn list_unacked(&self, queue_name: &str) -> Result<Vec<Message>>;
+
+    fn list_unacked_page(
+        &self,
+        queue_name: &str,
+        request: &MessagePageRequest,
+    ) -> Result<MessagePage>;
 
     /// Clear all messages from the queue
     fn clear(&mut self, queue_name: &str) -> Result<()>;
@@ -342,6 +372,60 @@ impl QueueBackend for MemoryBackend {
             .chain(queue.processing.iter())
             .cloned()
             .collect())
+    }
+
+    fn list_unacked_page(
+        &self,
+        queue_name: &str,
+        request: &MessagePageRequest,
+    ) -> Result<MessagePage> {
+        let queue = self
+            .queues
+            .get(queue_name)
+            .ok_or_else(|| Error::NotFound(format!("queue '{}' not found", queue_name)))?;
+        // 仅排序借用的引用，绝不复制整个内存队列的图片载荷。
+        let mut entries: Vec<_> = queue
+            .messages
+            .iter()
+            .chain(queue.processing.iter())
+            .collect();
+        entries.sort_by(|a, b| a.id.cmp(&b.id));
+        let through = request.through.clone().unwrap_or_else(|| {
+            entries
+                .last()
+                .map(|message| message.id.clone())
+                .unwrap_or_default()
+        });
+        let mut messages = Vec::new();
+        let mut bytes = 0;
+        let mut more = false;
+        for message in entries.into_iter().filter(|message| {
+            request
+                .after
+                .as_ref()
+                .is_none_or(|after| message.id > *after)
+                && message.id <= through
+        }) {
+            if !messages.is_empty()
+                && (messages.len() >= request.limit
+                    || bytes + message.data.len() > request.max_bytes)
+            {
+                more = true;
+                break;
+            }
+            bytes += message.data.len();
+            messages.push(message.clone());
+        }
+        let next_cursor = if more {
+            messages.last().map(|m| m.id.clone())
+        } else {
+            None
+        };
+        Ok(MessagePage {
+            messages,
+            next_cursor,
+            through,
+        })
     }
 
     fn clear(&mut self, queue_name: &str) -> Result<()> {
@@ -809,6 +893,84 @@ impl QueueBackend for SQLiteQueueBackend {
         Ok(messages)
     }
 
+    fn list_unacked_page(
+        &self,
+        queue_name: &str,
+        request: &MessagePageRequest,
+    ) -> Result<MessagePage> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| Error::internal(format!("sqlite mutex poisoned: {}", e)))?;
+        Self::require_queue_exists(&conn, queue_name)?;
+        let parse_cursor = |value: &str| -> Result<i64> {
+            value
+                .parse::<i64>()
+                .ok()
+                .filter(|id| *id >= 0)
+                .ok_or_else(|| Error::InvalidOperation("invalid SQLite queue cursor".into()))
+        };
+        let after = request
+            .after
+            .as_deref()
+            .map(parse_cursor)
+            .transpose()?
+            .unwrap_or(0);
+        let through = match request.through.as_deref() {
+            Some(value) => parse_cursor(value)?,
+            None => conn
+                .query_row(
+                    "SELECT COALESCE(MAX(id), 0) FROM queue_messages WHERE queue_name = ?1",
+                    params![queue_name],
+                    |row| row.get(0),
+                )
+                .map_err(|e| Error::internal(format!("sqlite queue upper bound error: {}", e)))?,
+        };
+        // 使用官方 #6151 的附加索引，游标翻页也不能退回全表排序。
+        let mut statement = conn
+            .prepare(
+                "SELECT id, data FROM queue_messages INDEXED BY idx_queue_unacked
+             WHERE queue_name = ?1 AND id > ?2 AND id <= ?3
+               AND status IN ('pending', 'processing') ORDER BY id LIMIT ?4",
+            )
+            .map_err(|e| Error::internal(format!("sqlite queue page prepare error: {}", e)))?;
+        let mut rows = statement
+            .query(params![queue_name, after, through, request.limit as i64])
+            .map_err(|e| Error::internal(format!("sqlite queue page query error: {}", e)))?;
+        let mut messages = Vec::new();
+        let mut bytes = 0;
+        let mut cursor = after;
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| Error::internal(format!("sqlite queue page row error: {}", e)))?
+        {
+            let id: i64 = row.get(0).map_err(|e| Error::internal(e.to_string()))?;
+            let raw = read_sqlite_text(row, 1).map_err(|e| Error::internal(e.to_string()))?;
+            // 单条超出预算时独占一页，既不丢弃，也不返回无法前进的空页。
+            if !messages.is_empty() && bytes + raw.len() > request.max_bytes {
+                break;
+            }
+            bytes += raw.len();
+            let stored: StoredMessage = serde_json::from_str(&raw)?;
+            messages.push(stored.into_message());
+            cursor = id;
+        }
+        let more: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM queue_messages INDEXED BY idx_queue_unacked
+             WHERE queue_name = ?1 AND id > ?2 AND id <= ?3
+               AND status IN ('pending', 'processing'))",
+                params![queue_name, cursor, through],
+                |row| row.get(0),
+            )
+            .map_err(|e| Error::internal(format!("sqlite queue page continuation error: {}", e)))?;
+        Ok(MessagePage {
+            messages,
+            next_cursor: more.then(|| cursor.to_string()),
+            through: through.to_string(),
+        })
+    }
+
     fn clear(&mut self, queue_name: &str) -> Result<()> {
         let conn = self
             .conn
@@ -874,6 +1036,121 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
     use tempfile::TempDir;
+
+    fn assert_bounded_recovery(mut backend: Box<dyn QueueBackend>) {
+        backend.create_queue("images").unwrap();
+        backend.create_queue("other").unwrap();
+        for index in 0..70 {
+            let mut message = Message::new(vec![42; if index == 20 { 32000 } else { 1000 }]);
+            message.id = format!("image-{index:04}");
+            backend.enqueue("images", message).unwrap();
+        }
+        backend
+            .enqueue("other", Message::new(vec![0; 1000]))
+            .unwrap();
+        backend.dequeue("images").unwrap();
+        let mut request = MessagePageRequest {
+            after: None,
+            through: None,
+            limit: 3,
+            max_bytes: 5000,
+        };
+        let mut ids = Vec::new();
+        let mut oversize = false;
+        let mut pages = 0;
+        loop {
+            let page = backend.list_unacked_page("images", &request).unwrap();
+            assert!(page.messages.len() <= 3);
+            for message in &page.messages {
+                if message.data.len() > request.max_bytes {
+                    assert_eq!(page.messages.len(), 1);
+                    oversize = true;
+                }
+                ids.push(message.id.clone());
+            }
+            pages += 1;
+            if pages == 1 {
+                // 恢复过程中确认旧投递、添加新消息，不应让游标跳过原有消息。
+                backend.ack("images", "image-0000").unwrap();
+                let mut late = Message::new(vec![1]);
+                late.id = "zz-new".into();
+                backend.enqueue("images", late).unwrap();
+            }
+            request.through = Some(page.through);
+            match page.next_cursor {
+                Some(cursor) => {
+                    assert_ne!(request.after.as_ref(), Some(&cursor));
+                    request.after = Some(cursor);
+                }
+                None => break,
+            }
+            assert!(pages < 100);
+        }
+        assert_eq!(
+            ids,
+            (0..70).map(|i| format!("image-{i:04}")).collect::<Vec<_>>()
+        );
+        assert!(oversize);
+        let status = backend.status("images").unwrap();
+        assert_eq!(status.pending, 70);
+        assert_eq!(status.processing, 0);
+        assert_eq!(backend.size("other").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_memory_recovery_pages_preserve_deliveries() {
+        assert_bounded_recovery(Box::new(MemoryBackend::new()));
+    }
+
+    #[test]
+    fn test_sqlite_recovery_pages_preserve_deliveries() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("queue.db");
+        assert_bounded_recovery(Box::new(
+            SQLiteQueueBackend::open(path.to_str().unwrap(), SQLiteQueueOptions::default())
+                .unwrap(),
+        ));
+    }
+
+    #[test]
+    fn test_sqlite_recovery_page_query_never_sorts() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("queue.db");
+        let backend =
+            SQLiteQueueBackend::open(path.to_str().unwrap(), SQLiteQueueOptions::default())
+                .unwrap();
+        let connection = backend.conn.lock().unwrap();
+        let mut statement = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT id,data FROM queue_messages INDEXED BY idx_queue_unacked
+             WHERE queue_name=?1 AND id>?2 AND id<=?3 AND status IN ('pending','processing')
+             ORDER BY id LIMIT ?4",
+            )
+            .unwrap();
+        let plan: Vec<String> = statement
+            .query_map(params!["images", 0, 1000, 32], |row| row.get(3))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert!(plan.iter().any(|line| line.contains("idx_queue_unacked")));
+        assert!(plan.iter().all(|line| !line.contains("TEMP B-TREE")));
+    }
+
+    #[test]
+    fn test_stored_message_byte_visitor_preserves_old_and_new_formats() {
+        let bytes: StoredMessage =
+            serde_json::from_str(r#"{"id":"bytes","data":[0,128,255]}"#).unwrap();
+        assert_eq!(bytes.data, vec![0, 128, 255]);
+        let legacy: StoredMessage =
+            serde_json::from_str(r#"{"id":"legacy","data":"旧消息"}"#).unwrap();
+        assert_eq!(legacy.data, "旧消息".as_bytes());
+        for invalid in ["[-1]", "[256]", "[1.5]", "[true]", "null", "{}"] {
+            assert!(serde_json::from_str::<StoredMessage>(&format!(
+                r#"{{"id":"bad","data":{invalid}}}"#
+            ))
+            .is_err());
+        }
+    }
 
     /// Create an in-memory backend with a test queue.
     fn memory_backend_with_queue(queue: &str) -> MemoryBackend {
@@ -1276,7 +1553,9 @@ mod tests {
         let (_dir, db_path, _backend) = sqlite_backend();
 
         let conn = Connection::open(db_path).unwrap();
-        let auto_vacuum: i64 = conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0)).unwrap();
+        let auto_vacuum: i64 = conn
+            .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(auto_vacuum, 1);
     }
 
@@ -1307,10 +1586,13 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let _backend = SQLiteQueueBackend::open(&db_path_str, SQLiteQueueOptions::default()).unwrap();
+        let _backend =
+            SQLiteQueueBackend::open(&db_path_str, SQLiteQueueOptions::default()).unwrap();
 
         let conn = Connection::open(&db_path_str).unwrap();
-        let auto_vacuum: i64 = conn.query_row("PRAGMA auto_vacuum", [], |row| row.get(0)).unwrap();
+        let auto_vacuum: i64 = conn
+            .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(auto_vacuum, 0);
     }
 
