@@ -138,6 +138,8 @@ jobs:
           tests/storage/test_queue_manager.py
           tests/storage/test_named_queue_middleware.py
           tests/storage/test_image_embedding_fallback.py
+          tests/parse/test_feishu_empty_whiteboard.py
+          tests/parse/test_feishu_accessor.py
           tests/storage/test_collection_schemas.py
           tests/test_session_task_tracking.py
           tests/test_task_tracker.py
