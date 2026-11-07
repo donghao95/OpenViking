@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import io
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -167,5 +168,24 @@ async def test_caption_cancellation_propagates_without_writing_vector(setup):
     job.cancel()
     with pytest.raises(asyncio.CancelledError):
         await job
+    assert not embedder.inputs
+    db.upsert.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "raw", [b"<!doctype html><html>synthetic</html>", b"not an image", b"\x89PNG\r\n"]
+)
+async def test_invalid_image_never_calls_model_or_writes_vector(setup, raw):
+    handler, embedder, vlm, _, db = setup
+    message, _ = delivery()
+    payload = json.loads(message["data"])
+    payload["payload"]["message"][0]["image_url"]["url"] = (
+        "data:image/png;base64," + base64.b64encode(raw).decode()
+    )
+    message["data"] = json.dumps(payload)
+    result = await handler.on_dequeue(message)
+    assert result.outcome is ProcessOutcome.FAILED
+    assert "not a decodable image" in result.error
+    vlm.get_vision_completion_async.assert_not_awaited()
     assert not embedder.inputs
     db.upsert.assert_not_awaited()

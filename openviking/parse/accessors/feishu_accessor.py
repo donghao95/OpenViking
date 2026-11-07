@@ -26,7 +26,11 @@ from lark_oapi.core.cache import ICache
 
 from openviking.parse.base import format_table_to_markdown
 from openviking.parse.feishu_import import FeishuImportPlan, recursive_wiki
-from openviking.parse.image_validation import IMAGE_MAX_FILE_BYTES, is_valid_image
+from openviking.parse.image_validation import (
+    IMAGE_MAX_FILE_BYTES,
+    is_valid_image,
+    require_decodable_image,
+)
 from openviking.parse.temp import get_parser_download_temp_dir
 from openviking.utils.exceptions import error_code_from_http_status
 from openviking_cli.exceptions import InvalidArgumentError, OpenVikingError
@@ -2749,6 +2753,10 @@ class FeishuAccessor(DataAccessor):
         if not content:
             logger.warning("[FeishuAccessor] Empty image response for %s", file_token)
             return None
+        try:
+            require_decodable_image(content)
+        except ValueError as exc:
+            raise InvalidArgumentError("Feishu media download is not a decodable image") from exc
         return content, self._response_content_type(raw)
 
     @classmethod

@@ -17,6 +17,17 @@ IMAGE_MAX_ASPECT_RATIO = 150
 IMAGE_MAX_FILE_BYTES = 10 * 1024 * 1024
 
 
+def require_decodable_image(image_bytes: bytes) -> None:
+    """验证实际图片内容，不信任后缀或服务端声明的MIME类型。"""
+    from PIL import Image
+
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            image.verify()
+    except Exception as exc:
+        raise ValueError("Image payload is not a decodable image") from exc
+
+
 def is_valid_image(image_bytes: bytes, source_path: Path) -> bool:
     """Return whether an extracted image is safe and useful to ingest."""
     if len(image_bytes) > IMAGE_MAX_FILE_BYTES:

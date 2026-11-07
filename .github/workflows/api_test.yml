@@ -140,6 +140,7 @@ jobs:
           tests/storage/test_image_embedding_fallback.py
           tests/parse/test_feishu_empty_whiteboard.py
           tests/parse/test_feishu_accessor.py
+          tests/storage/test_image_embedding_fallback.py
           tests/storage/test_collection_schemas.py
           tests/unit/test_codex_vlm.py
           tests/unit/test_codex_stream_errors.py
