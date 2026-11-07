@@ -73,6 +73,7 @@ async def test_slow_compile_shard_keeps_loop_responsive_and_settles_on_cancel(
         writer = asyncio.create_task(TaskFiles(sandbox).put("source", {"text": "原文"}))
         try:
             assert await asyncio.to_thread(started.wait, 1)
+            assert not release.is_set(), "事件循环只能等安全计时器释放磁盘后才继续，说明仍被阻塞"
             assert not writer.done(), "文件写入阻塞了事件循环，控制面无法及时响应"
             if cancel:
                 writer.cancel()
