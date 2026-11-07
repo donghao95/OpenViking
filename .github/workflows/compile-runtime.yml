@@ -1,0 +1,94 @@
+name: Compile runtime regressions
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - bot/vikingbot/compile/store.py
+      - bot/vikingbot/compile/pipeline_io.py
+      - bot/vikingbot/sandbox/backends/direct.py
+      - openviking/service/compile_service.py
+      - bot/tests/test_compile_file_io.py
+      - .github/workflows/compile-runtime.yml
+
+permissions:
+  contents: read
+
+jobs:
+  linux-regressions:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      PYTHONPATH: .:bot
+      LITELLM_LOCAL_MODEL_COST_MAP: 'True'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: astral-sh/setup-uv@v7
+      - uses: ./.github/actions/native-runtime
+      - name: 安装锁定的 Bot 测试依赖
+        run: uv sync --frozen --extra test --extra bot --no-install-project
+      - name: 创建隔离的合成模型配置
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          config = {
+              "storage": {"workspace": os.environ["RUNNER_TEMP"] + "/ov-compile-test"},
+              "embedding": {"dense": {
+                  "provider": "openai", "model": "synthetic", "api_key": "synthetic",
+                  "dimension": 8, "api_base": "http://127.0.0.1:1/v1",
+              }},
+              "vlm": {"provider": "openai", "model": "synthetic", "api_key": "synthetic",
+                      "api_base": "http://127.0.0.1:1/v1", "max_retries": 0},
+          }
+          path = Path(os.environ["RUNNER_TEMP"]) / "compile-test.conf"
+          path.write_text(json.dumps(config))
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              env.write(f"OPENVIKING_CONFIG_FILE={path}\n")
+          PY
+      - name: 慢盘、取消与图片证据回归
+        run: >-
+          uv run --no-sync pytest --noconftest -q -o addopts=''
+          bot/tests/test_compile_file_io.py
+          bot/tests/test_compile_sources.py
+          bot/tests/test_sandbox_startup.py
+          --junitxml=compile-runtime-results.xml
+      - run: git diff --check
+      - name: 保存经过 Linux 回归的源码指纹
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib, json, shutil, subprocess
+          from pathlib import Path
+          paths = [
+              "bot/vikingbot/compile/store.py",
+              "bot/vikingbot/compile/pipeline_io.py",
+              "bot/vikingbot/sandbox/backends/direct.py",
+              "openviking/service/compile_service.py",
+          ]
+          output = Path("compile-runtime-artifact")
+          hashes = {}
+          for name in paths:
+              target = output / name
+              target.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copyfile(name, target)
+              hashes[name] = hashlib.sha256(target.read_bytes()).hexdigest()
+          manifest = {
+              "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+              "tree": subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], text=True).strip(),
+              "files": hashes,
+          }
+          (output / "manifest.json").write_text(json.dumps(manifest, indent=2))
+          shutil.copyfile("compile-runtime-results.xml", output / "results.xml")
+          PY
+      - uses: actions/upload-artifact@v7
+        with:
+          name: compile-runtime-source-${{ github.sha }}
+          path: compile-runtime-artifact/
+          if-no-files-found: error

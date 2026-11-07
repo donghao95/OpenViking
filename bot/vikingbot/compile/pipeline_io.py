@@ -127,7 +127,9 @@ class TaskFiles:
         """Atomically replace one runtime-owned shard and return its relative reference."""
         reference = f"{ROOT}/{path}.json"
         temporary = reference + "." + uuid.uuid4().hex + ".tmp"
-        await self.sandbox.write_file(temporary, json.dumps(value, ensure_ascii=False))
+        # 只对内核分片写盘使用后台 I/O，保持模型工具批次原有的写入可见顺序。
+        write = getattr(self.sandbox, "_write_file_nonblocking", self.sandbox.write_file)
+        await write(temporary, json.dumps(value, ensure_ascii=False))
         local_path = self.sandbox.local_file_path(temporary)
         if local_path is not None:
             # Both names share the sandbox-validated parent; only the suffix differs.

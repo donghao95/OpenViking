@@ -10,6 +10,7 @@ from typing import Any
 
 from loguru import logger
 
+from openviking.service.task_tracker_concurrency import run_to_completion
 from vikingbot.config.schema import SandboxConfig, SessionKey
 from vikingbot.sandbox.backends import register_backend
 from vikingbot.sandbox.base import SandboxBackend
@@ -322,6 +323,13 @@ class DirectBackend(SandboxBackend):
             return data.decode("utf-8", errors="replace")
 
     async def write_file(self, path: str, content: str) -> None:
+        self._write_file(path, content)
+
+    async def _write_file_nonblocking(self, path: str, content: str) -> None:
+        # 慢盘写入和路径检查不能阻塞编译状态接口；取消时等实际 I/O 收尾。
+        await run_to_completion(lambda: asyncio.to_thread(self._write_file, path, content))
+
+    def _write_file(self, path: str, content: str) -> None:
         sandbox_path = Path(path)
         if not sandbox_path.is_absolute():
             sandbox_path = self._workspace / path
