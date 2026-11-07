@@ -46,6 +46,8 @@ class ModelError(Exception):
 
 
 _CODE_KINDS = {
+    # Responses流也会在HTTP成功后以该错误码终止。
+    "SERVERERROR": ModelErrorKind.TRANSIENT_SERVICE_ERROR,
     # Authentication and authorization.
     "APIKEYINVALID": ModelErrorKind.AUTHENTICATION_ERROR,
     "INVALIDAPIKEY": ModelErrorKind.AUTHENTICATION_ERROR,
@@ -300,13 +302,13 @@ def _sdk_kind(error: BaseException) -> tuple[ModelErrorKind, str] | None:
 
 
 def model_error_from_status(
-    status_code: int,
+    status_code: int | None,
     message: str,
     *,
     provider: str,
     code: str | None = None,
 ) -> ModelError:
-    """Build a model error from a structured HTTP or provider status."""
+    """归一化HTTP状态或提供方错误码；流内错误可以没有HTTP失败状态。"""
     normalized = _normalized_code(code)
     kind = _CODE_KINDS.get(normalized) if normalized else None
     return ModelError(
