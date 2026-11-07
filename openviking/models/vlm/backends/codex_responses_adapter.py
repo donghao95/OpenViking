@@ -8,6 +8,8 @@ import json
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional
 
+from openviking.models.model_error import ModelError, ModelErrorKind, model_error_from_status
+
 
 def _convert_content_for_responses(content: Any) -> Any:
     if isinstance(content, str):
@@ -156,6 +158,13 @@ def _build_chat_completion_like_response(final_response: Any, model: str) -> Any
         item_type = _item_get(item, "type")
         if item_type == "message":
             for part in _item_get(item, "content", []) or []:
+                if _item_get(part, "type") == "refusal":
+                    raise ModelError(
+                        ModelErrorKind.CONTENT_SAFETY,
+                        "Codex Responses request was refused.",
+                        provider="openai-codex",
+                        code="content_filter",
+                    )
                 if _item_get(part, "type") in {"output_text", "text"}:
                     text_parts.append(str(_item_get(part, "text", "")))
             continue
@@ -282,6 +291,21 @@ class CodexCompletionsAdapter:
         try:
             for event in stream:
                 event_type = getattr(event, "type", "")
+                if event_type in {"response.failed", "response.incomplete", "error"}:
+                    response = _item_get(event, "response")
+                    detail = (
+                        _item_get(response, "error")
+                        or _item_get(response, "incomplete_details")
+                        or event
+                    )
+                    code = _item_get(detail, "code") or _item_get(detail, "reason") or event_type
+                    # 只保留结构化错误码，不把可能含输入正文的提供方消息写入任务错误。
+                    raise model_error_from_status(
+                        None,
+                        "Codex Responses request did not complete.",
+                        provider="openai-codex",
+                        code=code,
+                    )
                 if event_type == "response.output_item.done":
                     item = getattr(event, "item", None)
                     if item is not None:
@@ -301,13 +325,29 @@ class CodexCompletionsAdapter:
             close = getattr(stream, "close", None)
             if callable(close):
                 close()
+        if completed_response is None:
+            raise ModelError(
+                ModelErrorKind.TRANSIENT_NETWORK_ERROR,
+                "Codex Responses stream ended before completion.",
+                provider="openai-codex",
+                code="stream_ended_before_completion",
+            )
         final_response = _build_final_response_from_stream_events(
             completed_response,
             collected_output_items,
             collected_text_deltas,
             has_function_calls,
         )
-        return _build_chat_completion_like_response(final_response, model)
+        result = _build_chat_completion_like_response(final_response, model)
+        message = result.choices[0].message
+        if not message.content and not message.tool_calls:
+            raise ModelError(
+                ModelErrorKind.TRANSIENT_SERVICE_ERROR,
+                "Codex Responses returned no answer.",
+                provider="openai-codex",
+                code="empty_model_output",
+            )
+        return result
 
     def create(self, **kwargs) -> Any:
         if kwargs.get("stream"):

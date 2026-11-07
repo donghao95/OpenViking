@@ -141,6 +141,8 @@ jobs:
           tests/parse/test_feishu_empty_whiteboard.py
           tests/parse/test_feishu_accessor.py
           tests/storage/test_collection_schemas.py
+          tests/unit/test_codex_vlm.py
+          tests/unit/test_codex_stream_errors.py
           tests/test_session_task_tracking.py
           tests/test_task_tracker.py
           tests/service/test_task_work_contract.py
