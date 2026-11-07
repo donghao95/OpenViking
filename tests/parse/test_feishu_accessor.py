@@ -3,6 +3,7 @@
 """Tests for FeishuAccessor supported types, user token, and image handling."""
 
 import asyncio
+import io
 import json
 import sys
 from contextlib import nullcontext
@@ -20,6 +21,14 @@ from openviking.parse.accessors.feishu_accessor import (
 from openviking.parse.accessors.feishu_session import FeishuApiSession
 from openviking_cli.exceptions import OpenVikingError
 from openviking_cli.utils.config.parser_config import FeishuConfig
+
+
+def _image_bytes(fmt="PNG"):
+    from PIL import Image
+
+    stream = io.BytesIO()
+    Image.new("RGB", (32, 32), "white").save(stream, format=fmt)
+    return stream.getvalue()
 
 
 class _SuccessResponse:
@@ -288,9 +297,9 @@ def _use_fake_client(monkeypatch, accessor: FeishuAccessor, client):
     monkeypatch.setattr(
         accessor,
         "_user_request_option",
-        lambda token: _FakeRequestOption.builder().user_access_token(token).build()
-        if token
-        else None,
+        lambda token: (
+            _FakeRequestOption.builder().user_access_token(token).build() if token else None
+        ),
     )
 
 
@@ -431,10 +440,16 @@ def test_feishu_api_lists_paginated_content_with_user_token(monkeypatch):
         ]
     )
     accessor = FeishuAccessor()
-    _use_fake_client(monkeypatch, accessor, SimpleNamespace(
-        docx=SimpleNamespace(v1=SimpleNamespace(document_block=SimpleNamespace(list=list_blocks))),
-        request=list_drive,
-    ))
+    _use_fake_client(
+        monkeypatch,
+        accessor,
+        SimpleNamespace(
+            docx=SimpleNamespace(
+                v1=SimpleNamespace(document_block=SimpleNamespace(list=list_blocks))
+            ),
+            request=list_drive,
+        ),
+    )
 
     blocks = accessor._fetch_all_blocks("doc_token", feishu_access_token="u-test")
     children = accessor._list_drive_folder_children(
@@ -504,8 +519,7 @@ def test_feishu_api_lists_paginated_wiki_children_with_user_token(monkeypatch):
     assert list_wiki_children.call_args_list[0].args[0].queries["parent_node_token"] == "parent"
     assert list_wiki_children.call_args_list[1].args[0].queries["page_token"] == "page-2"
     assert all(
-        call.args[1].user_access_token == "u-test"
-        for call in list_wiki_children.call_args_list
+        call.args[1].user_access_token == "u-test" for call in list_wiki_children.call_args_list
     )
 
 
@@ -524,7 +538,7 @@ def test_resolve_image_refs_respects_download_images_disabled():
 
 def test_resolve_image_refs_downloads_media_and_rewrites_markdown(monkeypatch):
     _install_fake_lark_modules(monkeypatch)
-    request_media = MagicMock(return_value=_FakeMediaResponse(b"\x89PNG\r\n"))
+    request_media = MagicMock(return_value=_FakeMediaResponse(_image_bytes()))
     accessor = FeishuAccessor()
     _use_fake_client(monkeypatch, accessor, SimpleNamespace(request=request_media))
     accessor = _operation(accessor, config=_feishu_config(download_images=True))
@@ -534,7 +548,7 @@ def test_resolve_image_refs_downloads_media_and_rewrites_markdown(monkeypatch):
     )
 
     assert updated == "before ![screenshot](images/img_token_123.png) after"
-    assert images == {"images/img_token_123.png": b"\x89PNG\r\n"}
+    assert images == {"images/img_token_123.png": _image_bytes()}
     request = request_media.call_args.args[0]
     assert request.http_method == "GET"
     assert request.uri == "/open-apis/drive/v1/medias/img_token_123/download"
@@ -544,7 +558,7 @@ def test_resolve_image_refs_uses_content_type_extension(monkeypatch):
     _install_fake_lark_modules(monkeypatch)
     request_media = MagicMock(
         return_value=_FakeMediaResponse(
-            b"\xff\xd8\xff\xe0jpeg-bytes",
+            _image_bytes("JPEG"),
             headers={"Content-Type": "image/jpeg"},
         )
     )
@@ -555,13 +569,13 @@ def test_resolve_image_refs_uses_content_type_extension(monkeypatch):
     updated, images = accessor._resolve_image_refs("![j](feishu://image/img_token_jpeg)")
 
     assert updated == "![j](images/img_token_jpeg.jpg)"
-    assert images == {"images/img_token_jpeg.jpg": b"\xff\xd8\xff\xe0jpeg-bytes"}
+    assert images == {"images/img_token_jpeg.jpg": _image_bytes("JPEG")}
 
 
 def test_resolve_image_refs_falls_back_to_byte_magic_extension(monkeypatch):
     _install_fake_lark_modules(monkeypatch)
     # No usable Content-Type header; extension must come from WebP byte magic.
-    webp_bytes = b"RIFF\x00\x00\x00\x00WEBPfake"
+    webp_bytes = _image_bytes("WEBP")
     request_media = MagicMock(return_value=_FakeMediaResponse(webp_bytes, headers={}))
     accessor = FeishuAccessor()
     _use_fake_client(monkeypatch, accessor, SimpleNamespace(request=request_media))
@@ -578,7 +592,7 @@ def test_resolve_image_refs_tries_distinct_permission_contexts(monkeypatch):
     request_media = MagicMock(
         side_effect=[
             _FakeMediaResponse(success=False, code=400, status_code=400),
-            _FakeMediaResponse(b"\x89PNG\r\n"),
+            _FakeMediaResponse(_image_bytes()),
         ]
     )
     accessor = FeishuAccessor()
@@ -591,7 +605,7 @@ def test_resolve_image_refs_tries_distinct_permission_contexts(monkeypatch):
     )
 
     assert updated == "![s](images/shared-token.png)"
-    assert images == {"images/shared-token.png": b"\x89PNG\r\n"}
+    assert images == {"images/shared-token.png": _image_bytes()}
     requests = [call.args[0] for call in request_media.call_args_list]
     assert [request.queries["extra"] for request in requests] == [
         "context-one",
@@ -612,7 +626,7 @@ def test_resolve_image_refs_falls_back_to_token_only(
     request_media = MagicMock(
         side_effect=[
             _FakeMediaResponse(success=False, code=400, status_code=400),
-            _FakeMediaResponse(b"\x89PNG\r\n"),
+            _FakeMediaResponse(_image_bytes()),
         ]
     )
     accessor = FeishuAccessor()
@@ -626,7 +640,7 @@ def test_resolve_image_refs_falls_back_to_token_only(
     )
 
     assert updated == "![s](images/shared-token.png)"
-    assert images == {"images/shared-token.png": b"\x89PNG\r\n"}
+    assert images == {"images/shared-token.png": _image_bytes()}
     requests = [call.args[0] for call in request_media.call_args_list]
     assert [request.queries for request in requests] == [
         {"extra": "permission-context"},
@@ -668,7 +682,7 @@ def test_resolve_image_refs_bounds_permission_context_attempts(monkeypatch):
 
 def test_download_image_uses_tenant_token_without_user_token(monkeypatch):
     _install_fake_lark_modules(monkeypatch)
-    request_media = MagicMock(return_value=_FakeMediaResponse(b"\x89PNG\r\n"))
+    request_media = MagicMock(return_value=_FakeMediaResponse(_image_bytes()))
     accessor = FeishuAccessor()
     _use_fake_client(monkeypatch, accessor, SimpleNamespace(request=request_media))
 
@@ -682,7 +696,7 @@ def test_download_image_advertises_user_token_when_provided(monkeypatch):
     """With a user access token the media request must advertise USER, or
     lark-oapi never injects it and the download silently fails."""
     _install_fake_lark_modules(monkeypatch)
-    request_media = MagicMock(return_value=_FakeMediaResponse(b"\x89PNG\r\n"))
+    request_media = MagicMock(return_value=_FakeMediaResponse(_image_bytes()))
     accessor = FeishuAccessor()
     _use_fake_client(monkeypatch, accessor, SimpleNamespace(request=request_media))
 
@@ -889,7 +903,9 @@ def test_access_wiki_recursive_materializes_mixed_tree(monkeypatch):
         "wiki_root": _FeishuWikiTreeNode("wiki_root", "space", "飞书文档", "docx", "doc_root"),
         "wiki_pdf": _FeishuWikiTreeNode("wiki_pdf", "space", "非飞书文档.pdf", "file", "file_pdf"),
         "wiki_doc": _FeishuWikiTreeNode("wiki_doc", "space", "飞书文档", "docx", "doc_child"),
-        "wiki_leaf_doc": _FeishuWikiTreeNode("wiki_leaf_doc", "space", "子文档1", "docx", "doc_leaf"),
+        "wiki_leaf_doc": _FeishuWikiTreeNode(
+            "wiki_leaf_doc", "space", "子文档1", "docx", "doc_leaf"
+        ),
         "wiki_bin": _FeishuWikiTreeNode("wiki_bin", "space", "非飞书文档.bin", "file", "file_bin"),
     }
     children = {
@@ -946,12 +962,10 @@ def test_access_wiki_recursive_materializes_mixed_tree(monkeypatch):
         assert (resource.path / "飞书文档.md").read_text(encoding="utf-8") == "# doc_root"
         assert (resource.path / "子文档1.md").read_text(encoding="utf-8") == "# doc_leaf"
         assert not (resource.path / "子文档1" / "子文档1.md").exists()
-        assert (
-            resource.path / "非飞书文档" / "非飞书文档.pdf"
-        ).read_bytes() == b"%PDF-1.7"
-        assert (
-            resource.path / "非飞书文档" / "飞书文档" / "飞书文档.md"
-        ).read_text(encoding="utf-8") == "# doc_child"
+        assert (resource.path / "非飞书文档" / "非飞书文档.pdf").read_bytes() == b"%PDF-1.7"
+        assert (resource.path / "非飞书文档" / "飞书文档" / "飞书文档.md").read_text(
+            encoding="utf-8"
+        ) == "# doc_child"
         assert (
             resource.path / "非飞书文档" / "飞书文档" / "非飞书文档.bin"
         ).read_bytes() == b"binary"
@@ -1061,7 +1075,7 @@ def test_access_offloads_synchronous_download_to_thread(monkeypatch):
         ran_on["extras"] = _["media_download_extras"]
         return (
             "![s](images/img_token_123.png)",
-            {"images/img_token_123.png": b"\x89PNG\r\n"},
+            {"images/img_token_123.png": _image_bytes()},
         )
 
     monkeypatch.setattr(accessor, "_resolve_image_refs", fake_resolve)
@@ -1104,7 +1118,7 @@ def test_access_writes_downloaded_images_next_to_markdown(monkeypatch):
         "_resolve_image_refs",
         lambda markdown, **_: (
             "![screenshot](images/img_token_123.png)",
-            {"images/img_token_123.png": b"\x89PNG\r\n"},
+            {"images/img_token_123.png": _image_bytes()},
         ),
     )
 
@@ -1121,7 +1135,7 @@ def test_access_writes_downloaded_images_next_to_markdown(monkeypatch):
             "![screenshot](images/img_token_123.png)"
         )
         image_path = resource.path.parent / "images" / "img_token_123.png"
-        assert image_path.read_bytes() == b"\x89PNG\r\n"
+        assert image_path.read_bytes() == _image_bytes()
         assert resource.meta["original_filename"] == "Test Doc"
     finally:
         resource.cleanup()
@@ -1190,13 +1204,7 @@ def test_render_mindnote_handles_noncanonical_tree_shapes(nodes, expected):
 
 def test_mindnote_preflight_uses_tenant_token_without_user_token(monkeypatch):
     _install_fake_lark_modules(monkeypatch)
-    nodes = {
-        "data": {
-            "nodes": [
-                _mindnote_node("root", "Tenant Mindnote")
-            ]
-        }
-    }
+    nodes = {"data": {"nodes": [_mindnote_node("root", "Tenant Mindnote")]}}
     request = MagicMock(return_value=_FakeMediaResponse(json.dumps(nodes).encode()))
     accessor = FeishuAccessor()
     _use_fake_client(monkeypatch, accessor, SimpleNamespace(request=request))
@@ -1236,7 +1244,7 @@ def test_access_mindnote_preserves_user_token_for_media(monkeypatch):
     request = MagicMock(
         side_effect=[
             _FakeMediaResponse(json.dumps(nodes).encode()),
-            _FakeMediaResponse(b"\x89PNG\r\n\x1a\nimage"),
+            _FakeMediaResponse(_image_bytes()),
         ]
     )
     accessor = FeishuAccessor()
@@ -1258,7 +1266,7 @@ def test_access_mindnote_preserves_user_token_for_media(monkeypatch):
             "    ![mindnote image](images/image_token.png)"
         )
         assert (resource.path.parent / "images" / "image_token.png").read_bytes() == (
-            b"\x89PNG\r\n\x1a\nimage"
+            _image_bytes()
         )
         node_request, media_request = [call.args[0] for call in request.call_args_list]
         assert node_request.uri == "/open-apis/mindnote/v1/mindnotes/mindnote_token/nodes"
@@ -1322,10 +1330,14 @@ def test_fetch_document_dispatches_all_supported_types(monkeypatch):
             )
         )
     )
-    _use_fake_client(monkeypatch, accessor, SimpleNamespace(
-        request=raw_request,
-        wiki=SimpleNamespace(v2=SimpleNamespace(space=SimpleNamespace(get_node=get_wiki_node))),
-    ))
+    _use_fake_client(
+        monkeypatch,
+        accessor,
+        SimpleNamespace(
+            request=raw_request,
+            wiki=SimpleNamespace(v2=SimpleNamespace(space=SimpleNamespace(get_node=get_wiki_node))),
+        ),
+    )
 
     assert accessor._resolve_wiki_node("wiki_token", "u-test") == (
         "doc",
@@ -1535,7 +1547,7 @@ def test_parse_sheets_handles_grid_and_embedded_bitable(monkeypatch):
             _FakeMediaResponse(
                 b'{"data":{"valueRange":{"values":[["name","","amount"],["Rent | Fees\\nQ1","",1]]}}}'
             ),
-            _FakeMediaResponse(b"\x89PNG\r\n"),
+            _FakeMediaResponse(_image_bytes()),
         ]
     )
     list_tables = MagicMock()
@@ -1588,14 +1600,18 @@ def test_parse_sheets_handles_grid_and_embedded_bitable(monkeypatch):
         max_records_per_table=10,
         download_images=True,
     )
-    _use_fake_client(monkeypatch, accessor, SimpleNamespace(
-        request=request,
-        bitable=SimpleNamespace(
-            v1=SimpleNamespace(
-                app_table=SimpleNamespace(list=list_tables),
-                app_table_field=SimpleNamespace(list=list_fields),
-                app_table_record=SimpleNamespace(list=list_records),
-            ))
+    _use_fake_client(
+        monkeypatch,
+        accessor,
+        SimpleNamespace(
+            request=request,
+            bitable=SimpleNamespace(
+                v1=SimpleNamespace(
+                    app_table=SimpleNamespace(list=list_tables),
+                    app_table_field=SimpleNamespace(list=list_fields),
+                    app_table_record=SimpleNamespace(list=list_records),
+                )
+            ),
         ),
     )
     accessor = _operation(accessor, config=feishu_config)
@@ -1640,7 +1656,7 @@ def test_parse_sheets_handles_grid_and_embedded_bitable(monkeypatch):
     )
 
     assert "![cover.png](images/cover-token.png)" in resolved
-    assert images == {"images/cover-token.png": b"\x89PNG\r\n"}
+    assert images == {"images/cover-token.png": _image_bytes()}
     assert request.call_args_list[-1].args[0].uri == (
         "/open-apis/drive/v1/medias/cover-token/download"
     )
@@ -1834,3 +1850,21 @@ def test_access_keeps_raw_title_but_exposes_safe_original_filename(monkeypatch):
         assert resource.meta["original_filename"] == "API Docs_Overview"
     finally:
         resource.cleanup()
+
+
+@pytest.mark.parametrize(
+    "payload", [b"<!doctype html><html>synthetic</html>", b"", b"not an image"]
+)
+def test_download_image_does_not_accept_invalid_image_payload(monkeypatch, payload):
+    _install_fake_lark_modules(monkeypatch)
+    request_media = MagicMock(
+        return_value=_FakeMediaResponse(payload, headers={"Content-Type": "image/png"})
+    )
+    accessor = FeishuAccessor()
+    _use_fake_client(monkeypatch, accessor, SimpleNamespace(request=request_media))
+    if not payload:
+        assert accessor._download_image("synthetic_media") is None
+    else:
+        with pytest.raises(OpenVikingError, match="not a decodable image"):
+            accessor._download_image("synthetic_media")
+    assert request_media.call_count == 1

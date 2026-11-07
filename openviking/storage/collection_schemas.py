@@ -632,6 +632,7 @@ class TextEmbeddingHandler(DequeueHandlerBase):
         if isinstance(abstract, str) and abstract.strip():
             return abstract
 
+        from openviking.parse.image_validation import require_decodable_image
         from openviking.prompts import render_prompt
         from openviking.storage.viking_fs import get_viking_fs
         from openviking.utils.embedding_utils import _truncate_abstract_bytes
@@ -647,6 +648,7 @@ class TextEmbeddingHandler(DequeueHandlerBase):
         for ref in image_refs:
             if ref.startswith("data:image/") and ";base64," in ref:
                 raw = base64.b64decode(ref.split(",", 1)[1], validate=True)
+                require_decodable_image(raw)
                 images.append(prepare_image_bytes_for_model(raw, config=image_config))
             else:
                 images.append(ref)

@@ -26,7 +26,11 @@ from lark_oapi.core.cache import ICache
 
 from openviking.parse.base import format_table_to_markdown
 from openviking.parse.feishu_import import FeishuImportPlan, recursive_wiki
-from openviking.parse.image_validation import IMAGE_MAX_FILE_BYTES, is_valid_image
+from openviking.parse.image_validation import (
+    IMAGE_MAX_FILE_BYTES,
+    is_valid_image,
+    require_decodable_image,
+)
 from openviking.parse.temp import get_parser_download_temp_dir
 from openviking.utils.exceptions import error_code_from_http_status
 from openviking_cli.exceptions import InvalidArgumentError, OpenVikingError
@@ -545,9 +549,7 @@ class FeishuAccessor(DataAccessor):
 
             if doc_type == "folder":
                 temp_dir = Path(
-                    tempfile.mkdtemp(
-                        prefix="ov_feishu_folder_", dir=get_parser_download_temp_dir()
-                    )
+                    tempfile.mkdtemp(prefix="ov_feishu_folder_", dir=get_parser_download_temp_dir())
                 )
                 plan = self._new_import_plan(temp_dir, kwargs)
                 plan.source_url = source_str
@@ -585,9 +587,7 @@ class FeishuAccessor(DataAccessor):
 
             if doc_type == "wiki" and recursive_wiki(kwargs):
                 temp_dir = Path(
-                    tempfile.mkdtemp(
-                        prefix="ov_feishu_wiki_", dir=get_parser_download_temp_dir()
-                    )
+                    tempfile.mkdtemp(prefix="ov_feishu_wiki_", dir=get_parser_download_temp_dir())
                 )
                 plan = self._new_import_plan(temp_dir, kwargs)
                 plan.source_url = source_str
@@ -1999,9 +1999,7 @@ class FeishuAccessor(DataAccessor):
 
     @classmethod
     def _mindnote_element_payload(cls, element: Dict[str, Any], element_type: str) -> Any:
-        payload_key = {"user": "mention_user", "doc": "mention_doc"}.get(
-            element_type, element_type
-        )
+        payload_key = {"user": "mention_user", "doc": "mention_doc"}.get(element_type, element_type)
         return element.get(payload_key) if element.get(payload_key) is not None else element
 
     @staticmethod
@@ -2755,6 +2753,10 @@ class FeishuAccessor(DataAccessor):
         if not content:
             logger.warning("[FeishuAccessor] Empty image response for %s", file_token)
             return None
+        try:
+            require_decodable_image(content)
+        except ValueError as exc:
+            raise InvalidArgumentError("Feishu media download is not a decodable image") from exc
         return content, self._response_content_type(raw)
 
     @classmethod
@@ -2827,7 +2829,8 @@ class FeishuAccessor(DataAccessor):
         try:
             payload = json.loads(raw)
             data = payload.get("data") if isinstance(payload, dict) else None
-            nodes = data.get("nodes") if isinstance(data, dict) else None
+            # 飞书成功响应会对空画板省略nodes；仍保留预览图及来源链接。
+            nodes = data.get("nodes", []) if isinstance(data, dict) else None
         except (ValueError, RecursionError) as exc:
             raise OpenVikingError(
                 "Invalid Feishu whiteboard JSON response", code="PROCESSING_ERROR"
