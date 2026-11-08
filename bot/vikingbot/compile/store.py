@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from openviking.service.task_tracker_concurrency import run_to_completion
 from vikingbot.compile.models import (
     TERMINAL_STATUSES,
     CompileErrorInfo,
@@ -51,18 +52,25 @@ class CompileTaskStore:
     async def create(self, task: CompileTask) -> None:
         path = self._path(task.task_id)
         async with self._task_lock(task.task_id):
-            if path.exists():
-                raise FileExistsError(task.task_id)
-            self._write_atomic(path, task)
+
+            def create() -> None:
+                if path.exists():
+                    raise FileExistsError(task.task_id)
+                self._write_atomic(path, task)
+
+            await run_to_completion(lambda: asyncio.to_thread(create))
+
+    @staticmethod
+    def _read(path: Path) -> CompileTask | None:
+        try:
+            return CompileTask.model_validate_json(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
 
     async def get(self, task_id: str) -> CompileTask | None:
         path = self._path(task_id)
-        if not path.exists():
-            return None
         async with self._task_lock(task_id):
-            if not path.exists():
-                return None
-            return CompileTask.model_validate_json(path.read_text(encoding="utf-8"))
+            return await run_to_completion(lambda: asyncio.to_thread(self._read, path))
 
     async def update(
         self,
@@ -70,20 +78,19 @@ class CompileTaskStore:
         mutate: Callable[[CompileTask], None],
     ) -> CompileTask:
         path = self._path(task_id)
-        if not path.exists():
-            raise FileNotFoundError(task_id)
         async with self._task_lock(task_id):
-            if not path.exists():
+            task = await run_to_completion(lambda: asyncio.to_thread(self._read, path))
+            if task is None:
                 raise FileNotFoundError(task_id)
-            task = CompileTask.model_validate_json(path.read_text(encoding="utf-8"))
             mutate(task)
             task.updated_at = utc_now()
-            self._write_atomic(path, task)
+            # 保持任务锁直到后台写入落定，防止取消后的旧写覆盖新状态。
+            await run_to_completion(lambda: asyncio.to_thread(self._write_atomic, path, task))
             return task
 
     async def mark_interrupted_failed(self) -> int:
         count = 0
-        for path in sorted(self.root.glob("cmp_*.json")):
+        for path in await asyncio.to_thread(lambda: sorted(self.root.glob("cmp_*.json"))):
             try:
                 task_id = path.stem
                 existing = await self.get(task_id)
@@ -115,7 +122,7 @@ class CompileTaskStore:
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=retention_seconds)
         retained: list[tuple[datetime, str]] = []
         expired: list[str] = []
-        for path in sorted(self.root.glob("cmp_*.json")):
+        for path in await asyncio.to_thread(lambda: sorted(self.root.glob("cmp_*.json"))):
             try:
                 task = await self.get(path.stem)
                 if task is None or task.status not in TERMINAL_STATUSES:
@@ -135,7 +142,9 @@ class CompileTaskStore:
         for task_id in task_ids:
             path = self._path(task_id)
             async with self._task_lock(task_id):
-                path.unlink(missing_ok=True)
+                await run_to_completion(
+                    lambda path=path: asyncio.to_thread(path.unlink, missing_ok=True)
+                )
         return len(task_ids)
 
     @staticmethod

@@ -366,8 +366,8 @@ class CompileService:
         self._local_endpoint = _CompileEndpoint(
             base_url=base_url.rstrip("/"),
             gateway_token=gateway_token,
-            http_timeout_seconds=10.0,
-            poll_interval_ms=30000,
+            http_timeout_seconds=self._config.http_timeout_seconds,
+            poll_interval_ms=self._config.poll_interval_ms,
             local=True,
         )
 
