@@ -17,6 +17,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Mapping
 
+import httpx
 from loguru import logger
 from pydantic import TypeAdapter
 
@@ -25,6 +26,7 @@ from openviking.core.skill_loader import validate_skill_format
 from openviking.utils.path_safety import (
     sanitize_relative_viking_path,
 )
+from openviking_cli._sdk_import import import_openviking_sdk
 from openviking_cli.exceptions import OpenVikingError
 from openviking_cli.utils.config.vlm_config import VLMConfig
 from vikingbot.agent.loop import (
@@ -101,6 +103,53 @@ _SKILL_EXCLUDED_FILES = frozenset(
 )
 _CATALOG_FRONTMATTER_LINES = 128  # prefix read to detect unclosed OKF frontmatter
 _COMPILE_BUDGET_REMINDER_THRESHOLDS = (15, 8, 3)  # remaining iterations
+_SDKOpenVikingError = import_openviking_sdk().OpenVikingError
+
+
+async def _retry_transient_read(
+    call_name: str,
+    uri: str,
+    read: Callable[..., Awaitable[Any]],
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """只对幂等读取的网络瞬时故障重试，保留最后一次原异常。"""
+    for attempt in range(3):
+        try:
+            return await read(*args, **kwargs)
+        except (
+            httpx.TimeoutException,
+            httpx.ConnectError,
+            httpx.RemoteProtocolError,
+            httpx.ReadError,
+            httpx.HTTPStatusError,
+            _SDKOpenVikingError,
+        ) as exc:
+            if isinstance(exc, httpx.HTTPStatusError):
+                if exc.response.status_code not in {502, 503, 504}:
+                    raise
+            elif isinstance(exc, _SDKOpenVikingError):
+                # SDK 未保留状态码属性，只识别其通用 HTTP 错误的明确前缀。
+                # 带业务错误码的异常及子类不作为网关错误重试。
+                if (
+                    type(exc) is not _SDKOpenVikingError
+                    or exc.code not in {"INTERNAL", "UNKNOWN"}
+                    or not any(
+                        str(exc) == f"HTTP {status}" or str(exc).startswith(f"HTTP {status}:")
+                        for status in (502, 503, 504)
+                    )
+                ):
+                    raise
+            if attempt == 2:
+                raise
+            logger.warning(
+                "Compile 只读调用重试：调用={}，URI={}，第 {} 次尝试失败，异常类型={}",
+                call_name,
+                uri,
+                attempt + 1,
+                type(exc).__name__,
+            )
+            await asyncio.sleep((5, 20)[attempt])
 
 
 def _compile_time(value: Any) -> datetime:
@@ -1545,7 +1594,7 @@ class BotCompileService:
         """
 
         async def inventory(root: str) -> list[dict[str, Any]]:
-            entry = await client.stat(root)
+            entry = await _retry_transient_read("stat", root, client.stat, root)
             if not entry.get("isDir", entry.get("is_dir", False)):
                 return [{**entry, "uri": root}]
             entries = []
@@ -1554,7 +1603,14 @@ class BotCompileService:
                 directory = pending.pop()
                 offset = 0
                 while True:
-                    page = await client.list_resources(directory, node_limit=500, offset=offset)
+                    page = await _retry_transient_read(
+                        "list_resources",
+                        directory,
+                        client.list_resources,
+                        directory,
+                        node_limit=500,
+                        offset=offset,
+                    )
                     for item in page:
                         uri = str(item.get("uri") or "").rstrip("/")
                         if not uri or (uri != root and not relative_uri_path(root, uri)):
@@ -1598,7 +1654,13 @@ class BotCompileService:
         ordered = files if files is not None else await self._list_source_files(client, roots)
         for start in range(0, len(ordered), 8):
             uris = ordered[start : start + 8]
-            contents = await asyncio.gather(*(read_source(client, uri) for uri in uris))
+            # read_source 只调用 read_raw，或图片的 stat 与 download_bytes。
+            contents = await asyncio.gather(
+                *(
+                    _retry_transient_read("read_source", uri, read_source, client, uri)
+                    for uri in uris
+                )
+            )
             sources.extend(zip(uris, contents, strict=True))
         return pack_source_batches(sources, self.limits)
 

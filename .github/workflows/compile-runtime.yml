@@ -8,7 +8,12 @@ on:
       - bot/vikingbot/compile/pipeline_io.py
       - bot/vikingbot/sandbox/backends/direct.py
       - openviking/service/compile_service.py
+      - openviking/service/task_store.py
+      - bot/vikingbot/compile/service.py
       - bot/tests/test_compile_file_io.py
+      - bot/tests/test_compile_read_retries.py
+      - tests/test_task_store_resilience.py
+      - tests/test_task_tracker.py
       - .github/workflows/compile-runtime.yml
 
 permissions:
@@ -57,6 +62,9 @@ jobs:
           uv run --no-sync pytest --noconftest -q -o addopts=''
           bot/tests/test_compile_file_io.py
           bot/tests/test_compile_sources.py
+          bot/tests/test_compile_read_retries.py
+          tests/test_task_store_resilience.py
+          tests/test_task_tracker.py
           bot/tests/test_sandbox_startup.py
           --junitxml=compile-runtime-results.xml
       - run: git diff --check
