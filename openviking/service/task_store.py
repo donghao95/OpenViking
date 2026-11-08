@@ -16,6 +16,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
 from typing import Any, Dict, List, Optional, Protocol
+from uuid import uuid4
 
 from openviking.pyagfs import AsyncAGFSClient
 from openviking.pyagfs.exceptions import AGFSAlreadyExistsError, AGFSNotFoundError
@@ -44,6 +45,11 @@ from openviking.service.task_tracker_concurrency import (
     KeyedAsyncLockPool,
     run_to_completion,
 )
+from openviking_cli.utils.logger import get_logger
+
+logger = get_logger(__name__)
+_CORRUPT_TASK_PATHS: set[str] = set()
+_CORRUPT_TASK_PATHS_LOCK = threading.Lock()
 
 SYSTEM_TASK_ACCOUNT_ID = "_system"
 SYSTEM_TASK_USER_ID = "root"
@@ -1125,7 +1131,9 @@ class PersistentTaskStore(TaskWorkStore):
             if not path.endswith(".json"):
                 continue
             try:
-                payload = json.loads(_decode_bytes(await self._read(path)))
+                payload = await self._read_task_payload(path)
+                if payload is None:
+                    continue
                 record = _task_from_payload(payload, account_id=account_id, user_id=user_id)
             except (AGFSNotFoundError, FileNotFoundError, ValueError, TypeError, KeyError):
                 continue
@@ -1543,10 +1551,10 @@ class PersistentTaskStore(TaskWorkStore):
         if not account_id or not user_id:
             return None
         try:
-            payload = json.loads(
-                _decode_bytes(await self._read(self._task_path(account_id, user_id, task_id)))
-            )
+            payload = await self._read_task_payload(self._task_path(account_id, user_id, task_id))
         except (AGFSNotFoundError, FileNotFoundError):
+            return None
+        if payload is None:
             return None
         task = _task_from_payload(payload, account_id=account_id, user_id=user_id)
         self._put_if_absent(task)
@@ -1586,6 +1594,27 @@ class PersistentTaskStore(TaskWorkStore):
     async def _read(self, path: str) -> Any:
         return await run_to_completion(lambda: self._agfs.read(path))
 
+    async def _read_task_payload(self, path: str) -> Optional[Dict[str, Any]]:
+        """保留损坏文件，并在进程内只报告一次每个路径。"""
+        raw = await self._read(path)
+        try:
+            payload = json.loads(_decode_bytes(raw))
+            if not isinstance(payload, dict):
+                raise ValueError("任务文件的 JSON 不是对象")
+            return payload
+        except ValueError as exc:
+            with _CORRUPT_TASK_PATHS_LOCK:
+                if path in _CORRUPT_TASK_PATHS:
+                    return None
+                _CORRUPT_TASK_PATHS.add(path)
+            logger.error(
+                "忽略损坏的任务文件：路径=%s，字节数=%s，异常类型=%s",
+                path,
+                len(raw) if isinstance(raw, bytes) else None,
+                type(exc).__name__,
+            )
+            return None
+
     async def _ls(self, path: str) -> Any:
         return await run_to_completion(lambda: self._agfs.ls(path))
 
@@ -1598,12 +1627,32 @@ class PersistentTaskStore(TaskWorkStore):
         await self._ensure_task_dir(task.account_id, task.user_id)
         payload = json.dumps(_task_to_payload(task), ensure_ascii=False).encode()
         path = self._task_path(task.account_id, task.user_id, task.task_id)
+
+        async def replace() -> None:
+            # 临时文件不以 .json 结尾，避免被任务扫描读取。
+            temporary = f"{path}.tmp-{uuid4().hex}"
+            try:
+                await run_to_completion(
+                    lambda: self._agfs.write(temporary, payload, auto_pathlock=False)
+                )
+                await run_to_completion(lambda: self._agfs.mv(temporary, path, auto_pathlock=False))
+            except BaseException:
+                try:
+                    await self._rm(temporary)
+                except Exception as exc:
+                    logger.error(
+                        "清理任务临时文件失败：路径=%s，异常类型=%s",
+                        temporary,
+                        type(exc).__name__,
+                    )
+                raise
+
         try:
-            await run_to_completion(lambda: self._agfs.write(path, payload, auto_pathlock=False))
+            await replace()
         except (AGFSNotFoundError, FileNotFoundError):
             self._ensured_task_dirs.discard((task.account_id, task.user_id))
             await self._ensure_task_dir(task.account_id, task.user_id)
-            await run_to_completion(lambda: self._agfs.write(path, payload, auto_pathlock=False))
+            await replace()
 
     async def _ensure_task_dir(self, account_id: str, user_id: str) -> None:
         key = (account_id, user_id)
@@ -1642,8 +1691,8 @@ class PersistentTaskStore(TaskWorkStore):
             if not path.endswith(".json"):
                 continue
             try:
-                value = json.loads(_decode_bytes(await self._read(path)))
-                if isinstance(value, dict):
+                value = await self._read_task_payload(path)
+                if value is not None:
                     payloads.append(value)
             except (AGFSNotFoundError, FileNotFoundError, ValueError, TypeError):
                 continue
@@ -1680,7 +1729,7 @@ class PersistentTaskStore(TaskWorkStore):
                     if (account_id, user_id, task_id) in seen:
                         continue
                     try:
-                        payload = json.loads(_decode_bytes(await self._read(path)))
+                        payload = await self._read_task_payload(path)
                     except (
                         AGFSNotFoundError,
                         FileNotFoundError,
@@ -1689,7 +1738,7 @@ class PersistentTaskStore(TaskWorkStore):
                     ):
                         yield None
                         continue
-                    yield payload if isinstance(payload, dict) else None
+                    yield payload
 
     def _task_dir_chain(self, account_id: str, user_id: str) -> tuple[str, ...]:
         return (

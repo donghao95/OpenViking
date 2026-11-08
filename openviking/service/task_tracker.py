@@ -403,7 +403,19 @@ class TaskTracker:
     async def restore_work_tasks(self, owners: Dict[str, tuple[str, str]]) -> List[TaskRecord]:
         restored = []
         for task_id, (account_id, user_id) in owners.items():
-            task = await self.get(task_id, account_id=account_id, user_id=user_id)
+            try:
+                task = await self.get(task_id, account_id=account_id, user_id=user_id)
+            except ValueError as exc:
+                logger.error(
+                    "启动恢复跳过无效任务：task_id=%s，account_id=%s，user_id=%s，"
+                    "异常类型=%s，消息=%s",
+                    task_id,
+                    account_id,
+                    user_id,
+                    type(exc).__name__,
+                    str(exc),
+                )
+                continue
             if task is not None:
                 restored.append(task)
         return restored

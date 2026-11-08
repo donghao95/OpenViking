@@ -115,6 +115,11 @@ class _FakeAgfs:
             return data[offset : offset + size]
         return data[offset:]
 
+    def mv(self, old_path: str, new_path: str, *, ctx=None):
+        """模拟同目录文件的覆盖重命名。"""
+        self.files[new_path] = self.files.pop(old_path)
+        return {"message": "renamed"}
+
     def ls(self, path: str = "/"):
         prefix = path.rstrip("/") or "/"
         if prefix not in self.dirs:
