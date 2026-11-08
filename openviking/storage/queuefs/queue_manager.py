@@ -181,14 +181,26 @@ class QueueManager:
                 del message
                 if metadata is None or not metadata.account_id or not metadata.user_id:
                     continue
+                try:
+                    await tracker.reconcile_delivery(
+                        metadata.task_id,
+                        metadata.work_id,
+                        queue_name,
+                        account_id=metadata.account_id,
+                        user_id=metadata.user_id,
+                    )
+                except ValueError as exc:
+                    logger.error(
+                        "启动队列恢复跳过无效任务：task_id=%s，work_id=%s，queue_name=%s，"
+                        "异常类型=%s，消息=%s",
+                        metadata.task_id,
+                        metadata.work_id,
+                        queue_name,
+                        type(exc).__name__,
+                        str(exc),
+                    )
+                    continue
                 owners[metadata.task_id] = (metadata.account_id, metadata.user_id)
-                await tracker.reconcile_delivery(
-                    metadata.task_id,
-                    metadata.work_id,
-                    queue_name,
-                    account_id=metadata.account_id,
-                    user_id=metadata.user_id,
-                )
         return await tracker.restore_work_tasks(owners)
 
     async def get_queued_tasks(self, tracker: Any, queue_name: str) -> list[Any]:

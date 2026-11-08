@@ -1836,30 +1836,18 @@ def _restore_failed_works(task: TaskRecord) -> Dict[str, WorkRecord]:
     """恢复失败记录；不把其它身份或非失败记录当成恢复依据。"""
     payloads = task._extra_fields.get(_FAILED_WORK_CHECKPOINT, [])
     if not isinstance(payloads, list):
-        logger.error("忽略失败 Work 检查点：任务=%s，原因=检查点不是列表", task.task_id)
-        return {}
+        raise ValueError("Invalid failed Work checkpoint")
     works: Dict[str, WorkRecord] = {}
-    for index, payload in enumerate(payloads):
-        try:
-            work = WorkRecord(**{**payload, "state": WorkState(payload["state"])})
-            if (
-                work.state is not WorkState.FAILED
-                or (work.account_id, work.user_id, work.task_id)
-                != (task.account_id, task.user_id, task.task_id)
-                or work.work_id in works
-            ):
-                reason = "身份或状态不符，或 Work 标识重复"
-            else:
-                works[work.work_id] = work
-                continue
-        except (ValueError, TypeError, KeyError) as exc:
-            reason = f"条目结构无效（{type(exc).__name__}）"
-        logger.error(
-            "忽略失败 Work 检查点条目：任务=%s，条目序号=%s，原因=%s",
-            task.task_id,
-            index,
-            reason,
-        )
+    for payload in payloads:
+        work = WorkRecord(**{**payload, "state": WorkState(payload["state"])})
+        if (
+            work.state is not WorkState.FAILED
+            or (work.account_id, work.user_id, work.task_id)
+            != (task.account_id, task.user_id, task.task_id)
+            or work.work_id in works
+        ):
+            raise ValueError("Invalid failed Work checkpoint owner or state")
+        works[work.work_id] = work
     return works
 
 
