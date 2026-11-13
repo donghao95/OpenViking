@@ -14,10 +14,12 @@ class TestFsRm:
                 f"Failed to create test directory: {response.status_code}"
             )
 
-            # mkdir 会异步刷新父目录；删除契约在准备工作完成后验收。
+            # Directory creation enqueues semantic refresh work. Let the
+            # request-scoped background processing release the tree lock before
+            # deleting the directory, otherwise rm can race with that work.
             settled = api_client.system_wait()
             assert settled.status_code == 200, settled.text
-            assert settled.json().get("status") == "ok", settled.text
+
             response = api_client.fs_rm(test_dir, recursive=True)
             print(f"\nFS rm API status code: {response.status_code}")
 

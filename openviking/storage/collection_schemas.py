@@ -824,7 +824,13 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                         import time as _time
 
                         _embed_t0 = _time.monotonic()
-                        with bind_ingestion_source_type(embedding_msg.source_type):
+                        from openviking.observability.reporting.facts import bind_embedding_purpose
+
+                        purpose = embedding_msg.context_data.get("context_type", "unknown")
+                        with (
+                            bind_ingestion_source_type(embedding_msg.source_type),
+                            bind_embedding_purpose(purpose),
+                        ):
                             embedding_input = await self._embedding_input_with_image_fallback(
                                 embedding_msg, embedder, ctx
                             )

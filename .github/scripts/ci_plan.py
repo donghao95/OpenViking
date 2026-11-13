@@ -5,9 +5,13 @@ import json
 import re
 import subprocess
 
-# 本部署仓只交付 VM226 使用的 Linux amd64 制品。
-FULL_OS = ["ubuntu-24.04"]
-
+FULL_OS = [
+    "ubuntu-24.04",
+    "ubuntu-24.04-arm",
+    "macos-15",
+    "macos-15-intel",
+    "windows-latest",
+]
 CI = r"^\.github/(workflows/(pr|api_test|_build|_test_lite|_test_full)\.yml|actions/|scripts/(ci_plan|native_bundle|test_ci_helpers)\.py)"
 PACKAGING = r"^(pyproject\.toml|uv\.lock|setup\.py|MANIFEST\.in|Cargo\.(toml|lock))$|^scripts/build_support/"
 NATIVE = r"^(src/|third_party/|crates/(?!ov_cli/))"
@@ -17,7 +21,9 @@ def plan(paths, full=False):
     def changed(pattern):
         return full or any(re.search(pattern, path) for path in paths)
 
-    # 原生、构建和界面变更仍做制品验收，运行平台按部署目标选择。
+    cross_platform = changed(f"{NATIVE}|{PACKAGING}|{CI}")
+    # CLI-only and Studio-only changes need a packaging smoke test, without
+    # occupying all five wheel runners. Native/build configuration changes do.
     wheel = changed(f"{NATIVE}|{PACKAGING}|{CI}|^crates/ov_cli/|^web-studio/")
     plugins = changed(
         r"^(examples/[^/]*(plugin|extension)[^/]*/|examples/memory-plugin-shared/|"
@@ -36,7 +42,7 @@ def plan(paths, full=False):
     api = full or any(not independent.search(path) for path in paths)
     return {
         "deps_changed": wheel,
-        "wheel_os": FULL_OS,
+        "wheel_os": FULL_OS if cross_platform else ["ubuntu-24.04"],
         "cuvs_changed": changed(
             f"{NATIVE}|{PACKAGING}|{CI}|"
             r"^openviking/storage/vectordb/|"
