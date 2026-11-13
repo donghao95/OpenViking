@@ -29,7 +29,7 @@ This module registers Streamable HTTP MCP servers, synchronizes and searches the
 | POST | `/api/v1/mcps` | Register a server and publish its tool catalog |
 | GET | `/api/v1/mcps` | List registered servers |
 | GET | `/api/v1/mcps/{name}` | Read a server and its current tool definitions |
-| GET | `/api/v1/mcps/status` | Check whether a server is reachable |
+| GET | `/api/v1/mcps/status?name=...` | Check whether a server is reachable |
 | POST | `/api/v1/mcps/{name}/sync` | Synchronize tools and report affected mounts |
 | DELETE | `/api/v1/mcps/{name}` | Remove a server and its tool catalog |
 | POST | `/api/v1/mcps/find` | Search tools semantically |
@@ -177,7 +177,7 @@ With `wait=false`, the registration result may also contain the underlying catal
 
 ### List, inspect, and check status
 
-Without `target_uri`, `GET /api/v1/mcps` merges user and shared servers and identifies each entry with `root_uri`. `GET /api/v1/mcps/{name}` and status default to the user space; pass `target_uri=viking://agent/tools` for a same-named shared server. A connection failure still has a successful HTTP envelope, but `result.status` is `error`.
+Without `target_uri`, `GET /api/v1/mcps` merges user and shared servers and identifies each entry with `root_uri`. `GET /api/v1/mcps/{name}` and `GET /api/v1/mcps/status?name=...` default to the user space; pass `target_uri=viking://agent/tools` for a same-named shared server. A connection failure still has a successful HTTP envelope, but `result.status` is `error`.
 
 **SDK and CLI**
 

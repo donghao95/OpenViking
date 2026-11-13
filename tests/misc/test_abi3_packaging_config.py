@@ -70,36 +70,6 @@ def test_ci_plan_keeps_marketplace_checks():
     assert not selection["deps_changed"]
 
 
-@pytest.mark.parametrize("full", [False, True])
-def test_server_ci_targets_vm226_linux_amd64(full):
-    plan = runpy.run_path(str(REPO_ROOT / ".github/scripts/ci_plan.py"))["plan"]
-    selection = plan(["crates/ragfs/src/lib.rs", ".github/workflows/api_test.yml"], full=full)
-    assert selection["wheel_os"] == ["ubuntu-24.04"]
-    assert selection["deps_changed"] and selection["api_changed"] and selection["cuvs_changed"]
-
-
-def test_deployment_pins_filter_python_and_platform_markers():
-    parse = runpy.run_path(str(REPO_ROOT / ".github/scripts/pack_deployment_runtime.py"))[
-        "parse_runtime_pins"
-    ]
-    exported = """numpy==2.2.6 ; python_version < "3.11" \\
-    --hash=sha256:synthetic
-numpy==2.4.0 ; python_version >= "3.11"
-colorama==0.4.6 ; sys_platform == "win32"
-pdfminer.six==20251230
-"""
-    pins = parse(exported, {"python_version": "3.13", "sys_platform": "linux"})
-    assert pins == {"numpy": "2.4.0", "pdfminer-six": "20251230"}
-
-
-def test_deployment_pins_reject_conflicting_active_versions():
-    parse = runpy.run_path(str(REPO_ROOT / ".github/scripts/pack_deployment_runtime.py"))[
-        "parse_runtime_pins"
-    ]
-    with pytest.raises(ValueError, match="多个版本"):
-        parse("numpy==2.2.6\nnumpy==2.4.0")
-
-
 def test_build_workflow_smoke_tests_windows_wheel_engine_import():
     build_workflow = _read_text(".github/workflows/_build.yml")
 

@@ -1,11 +1,24 @@
 import asyncio
+import math
 import shutil
 import threading
+import time
 import uuid
 from pathlib import Path
 from unittest.mock import MagicMock
+from weakref import WeakValueDictionary
 
 from openviking.pyagfs import AGFSNotFoundError
+
+
+class _MockCoordinationState:
+    """同一测试根目录的存活客户端共享协调状态，销毁后不滞留测试数据。"""
+
+    def __init__(self):
+        self.guard = threading.Lock()
+        self.leaders = {}
+        self.counter = 0
+        self.revisions = {}
 
 
 class MockLocalAGFS:
@@ -15,6 +28,11 @@ class MockLocalAGFS:
     feasible or desired.
     """
 
+    _coordination_states = WeakValueDictionary()
+    _coordination_states_guard = threading.Lock()
+    _coordination_now = staticmethod(time.monotonic)
+    _revision_ttl = 24 * 60 * 60
+
     def __init__(self, config=None, root_path=None):
         self.config = config
         self.root = Path(root_path) if root_path else Path("/tmp/viking_data")
@@ -22,6 +40,100 @@ class MockLocalAGFS:
         self._pathlocks_guard = threading.Lock()
         self._pathlocks = {}
         self._pathlock_leases = {}
+        with self._coordination_states_guard:
+            namespace = str(self.root.resolve())
+            state = self._coordination_states.get(namespace)
+            if state is None:
+                state = _MockCoordinationState()
+                self._coordination_states[namespace] = state
+            self._coordination = state
+        self._leader_refs = {}
+
+    @staticmethod
+    def _coordination_ttl(ttl_secs):
+        if not math.isfinite(ttl_secs) or ttl_secs <= 0:
+            raise ValueError("测试租约TTL必须是有限正数")
+        return ttl_secs
+
+    def _expire_coordination(self, now):
+        # 调用方持有共享锁；过期记录不能阻挡后继租约或长期积累。
+        state = self._coordination
+        state.leaders = {key: value for key, value in state.leaders.items() if value[1] > now}
+        state.revisions = {key: value for key, value in state.revisions.items() if value[1] > now}
+        self._leader_refs = {
+            ref: key
+            for ref, key in self._leader_refs.items()
+            if key in state.leaders and state.leaders[key][0] == ref
+        }
+
+    async def leader_validate_async(self) -> None:
+        """进程内实现不需要外部依赖，初始化即满足协调能力要求。"""
+        return None
+
+    async def leader_try_acquire_async(
+        self, key: str, holder_id: str, ttl_secs: float
+    ) -> str | None:
+        del holder_id
+        ttl = self._coordination_ttl(ttl_secs)
+        with self._coordination.guard:
+            now = self._coordination_now()
+            self._expire_coordination(now)
+            if key in self._coordination.leaders:
+                return None
+            # 与原生接口一样，持有者身份不充当可重复使用的所有权令牌。
+            reference = str(uuid.uuid4())
+            self._coordination.leaders[key] = (reference, now + ttl)
+            self._leader_refs[reference] = key
+            return reference
+
+    async def leader_renew_async(self, lease_ref: str, ttl_secs: float) -> bool:
+        ttl = self._coordination_ttl(ttl_secs)
+        with self._coordination.guard:
+            now = self._coordination_now()
+            self._expire_coordination(now)
+            key = self._leader_refs.get(lease_ref)
+            if key is None:
+                return False
+            self._coordination.leaders[key] = (lease_ref, now + ttl)
+            return True
+
+    async def leader_release_async(self, lease_ref: str) -> None:
+        with self._coordination.guard:
+            key = self._leader_refs.pop(lease_ref, None)
+            current = self._coordination.leaders.get(key)
+            if current is not None and current[0] == lease_ref:
+                del self._coordination.leaders[key]
+
+    async def revision_allocate_async(self, key: str) -> int:
+        if not key:
+            raise ValueError("测试修订键不能为空")
+        with self._coordination.guard:
+            self._expire_coordination(self._coordination_now())
+            self._coordination.counter += 1
+            return self._coordination.counter
+
+    async def revision_publish_async(self, key: str, revision: int) -> int:
+        if not key:
+            raise ValueError("测试修订键不能为空")
+        with self._coordination.guard:
+            now = self._coordination_now()
+            self._expire_coordination(now)
+            if (
+                not isinstance(revision, int)
+                or revision <= 0
+                or revision > self._coordination.counter
+            ):
+                raise ValueError("测试修订号必须已经分配且为正数")
+            latest = max(revision, self._coordination.revisions.get(key, (0, 0))[0])
+            self._coordination.revisions[key] = (latest, now + self._revision_ttl)
+            return latest
+
+    async def revision_latest_async(self, key: str) -> int:
+        if not key:
+            raise ValueError("测试修订键不能为空")
+        with self._coordination.guard:
+            self._expire_coordination(self._coordination_now())
+            return self._coordination.revisions.get(key, (0, 0))[0]
 
     def _resolve(self, path):
         if str(path).startswith("viking://"):
