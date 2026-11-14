@@ -384,14 +384,16 @@ async def test_image_payload_and_packing_reuse_registered_metadata(runtime, comb
 
 
 @pytest.mark.asyncio
-async def test_image_evidence_view_reads_snapshot_once(runtime):
+@pytest.mark.parametrize("with_line_bounds", [False, True])
+async def test_image_evidence_view_reads_snapshot_once(runtime, with_line_bounds):
     pipeline, png = runtime
     image = await seed(runtime)
     data = {"inputs": [await payload(pipeline, image)]}
     get = AsyncMock(wraps=pipeline.files.get)
     reader = EvidenceReader(SimpleNamespace(get=get), data)
 
-    result = await reader.execute(source_range=image.record_id)
+    bounds = {"start_line": 1, "end_line": 999} if with_line_bounds else {}
+    result = await reader.execute(source_range=image.record_id, **bounds)
 
     get.assert_awaited_once_with(f"sources/{image.record_id}")
     assert isinstance(result, MultimodalToolResult)
@@ -400,12 +402,68 @@ async def test_image_evidence_view_reads_snapshot_once(runtime):
     assert base64.b64decode(attached["image_url"]["url"].split(",", 1)[1]) == png
     assert "base64," not in result.text
     assert "image" not in json.loads(result.text)
+    stored = await pipeline.files.get(image.payload_ref)
+    unbounded = {
+        **{key: value for key, value in stored.items() if key != "image"},
+        "complete": False,
+    }
+    expected = dict(unbounded)
+    if with_line_bounds:
+        expected.update(
+            line_bounds_ignored=True,
+            note="Image evidence has no line numbers; line bounds were ignored "
+            "and the whole image was returned.",
+        )
+    assert json.loads(result.text) == expected
     assert (await pipeline.files.get(image.payload_ref))["image"] == attached
 
     get.reset_mock()
     metadata = await reader.read(image.record_id)
     get.assert_awaited_once_with(f"sources/{image.record_id}")
     assert "image" not in metadata and metadata["complete"] is False
+    assert metadata == unbounded
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_image", [False, True])
+async def test_image_evidence_read_ignores_line_hints(runtime, include_image):
+    pipeline, png = runtime
+    image = await seed(runtime)
+    assignment = await payload(pipeline, image)
+    assignment["payload"]["evidence_spans"] = [
+        {"source_range": image.record_id, "start_line": 1, "end_line": 999}
+    ]
+    reader = EvidenceReader(pipeline.files, {"inputs": [assignment]})
+    stored = await pipeline.files.get(image.payload_ref)
+    original = dict(stored)
+
+    result = await reader.read(
+        image.record_id, reader.spans[image.record_id], include_image=include_image
+    )
+
+    assert result == {
+        **{key: value for key, value in stored.items() if key != "image" or include_image},
+        "complete": False,
+        "line_bounds_ignored": True,
+        "note": "Image evidence has no line numbers; line bounds were ignored "
+        "and the whole image was returned.",
+    }
+    if include_image:
+        assert base64.b64decode(result["image"]["image_url"]["url"].split(",", 1)[1]) == png
+    assert stored == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("start,end", [(0, 1), (1, 3), (2, 1)])
+async def test_text_evidence_still_rejects_invalid_line_bounds(start, end):
+    files = MemoryFiles()
+    await files.put("sources/text", {"uri": TEXT, "text": "one\ntwo\n"})
+    reader = EvidenceReader(files, {"inputs": [{"payload": {"source_ranges": ["text"]}}]})
+
+    with pytest.raises(ValueError, match="outside the original source range"):
+        await reader.read("text", [(start, end)])
+    with pytest.raises(ValueError, match="outside the original source range"):
+        await reader.execute(source_range="text", start_line=start, end_line=end)
 
 
 @pytest.mark.asyncio
@@ -433,8 +491,10 @@ async def test_pipeline_stages_can_reread_original_images(runtime, stage, schema
     messages = pipeline.model.provider.chat.call_args.kwargs["messages"]
     assert _inline_media_bytes(messages) == len(png)
     reader = EvidenceReader(pipeline.files, data)
-    with pytest.raises(ValueError, match="no text line ranges"):
-        await reader.execute(source_range=image.record_id, start_line=1, end_line=1)
+    bounded = await reader.execute(source_range=image.record_id, start_line=1, end_line=1)
+    assert isinstance(bounded, MultimodalToolResult)
+    assert json.loads(bounded.text)["line_bounds_ignored"] is True
+    assert _inline_media_bytes([{"content": bounded.content}]) == len(png)
     with pytest.raises(ValueError, match="outside this assignment"):
         await reader.execute(source_range="foreign")
     result = await reader.execute(source_range=image.record_id)
