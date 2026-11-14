@@ -186,10 +186,13 @@ async def transform(
             return
         for index, draft in enumerate(response.records):
             allowed = {ref for r in records if r.record_id in draft.inputs for ref in r.source_refs}
+            text_spans = []
             for span in draft.evidence_spans:
                 if span.source_range not in allowed:
                     raise ValueError("Evidence span must belong to this record's supporting inputs")
                 source = runtime.evidence[span.source_range]
+                if source.get("media_kind") == "image":
+                    continue
                 line_count = (
                     source["end_line"]
                     - source["start_line"]
@@ -197,6 +200,8 @@ async def transform(
                 )
                 if not span.start_line <= span.end_line <= line_count:
                     raise ValueError("Evidence span lines are outside the original source range")
+                text_spans.append(span)
+            draft.evidence_spans = text_spans
             if draft.ready_path is not None:
                 validate_relative_file_path(draft.ready_path)
             has_ready = any(

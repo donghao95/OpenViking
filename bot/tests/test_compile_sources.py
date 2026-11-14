@@ -23,10 +23,11 @@ from vikingbot.bus.queue import MessageBus
 from vikingbot.compile import entry
 from vikingbot.compile.hashing import content_hash
 from vikingbot.compile.models import CompileFailure, CompileLimits, SanitizedCompileRequest
-from vikingbot.compile.ops.common import pack, payload
+from vikingbot.compile.ops.common import pack, payload, transform
 from vikingbot.compile.pipeline import Pipeline
 from vikingbot.compile.pipeline_agent import ChildProvider, complete_tool_result
 from vikingbot.compile.pipeline_io import ModelCallError
+from vikingbot.compile.plan import Transform
 from vikingbot.compile.results import CombineResponse, FileResponse, RecordResponse
 from vikingbot.compile.service import BotCompileService, _CompileProvider
 from vikingbot.compile.skill_resources import EvidenceReader
@@ -110,6 +111,136 @@ async def seed(runtime):
 
     records = await pipeline.seed(inputs())
     return records[-1]
+
+
+async def transform_assignment(runtime):
+    pipeline, _ = runtime
+    image = await seed(runtime)
+    text = next(record for record in pipeline.records.values() if record.routing_text == TEXT)
+    pipeline.contract = SimpleNamespace(distinguish=[])
+    return (
+        pipeline,
+        {"image": image, "text": text},
+        Transform(instructions="Extract source facts.", execution="direct"),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "spans,input_kinds,error",
+    [
+        ([("image", 1, 999)], ["image"], None),
+        ([("text", 1, 3)], ["text"], "outside the original source range"),
+        ([("image", 1, 1)], ["text"], "must belong to this record's supporting inputs"),
+        ([("text", 1, 1)], ["image"], "must belong to this record's supporting inputs"),
+        ([("image", 1, 999), ("text", 1, 2)], ["image", "text"], None),
+    ],
+)
+async def test_transform_filters_only_owned_image_spans(runtime, spans, input_kinds, error):
+    pipeline, sources, task = await transform_assignment(runtime)
+    response = RecordResponse.model_validate(
+        {
+            "records": [
+                {
+                    "inputs": [sources[kind].record_id for kind in input_kinds],
+                    "payload": {"text": "Source facts."},
+                    "evidence_spans": [
+                        {
+                            "source_range": sources[kind].record_id,
+                            "start_line": start,
+                            "end_line": end,
+                        }
+                        for kind, start, end in spans
+                    ],
+                }
+            ]
+        }
+    )
+
+    async def submit(stage, system, data, schema, validate, **kwargs):
+        validate(response)
+        return response
+
+    pipeline.model.ask = AsyncMock(side_effect=submit)
+    if error:
+        with pytest.raises(ValueError, match=error):
+            await transform(pipeline, "map", task, list(sources.values()), prompt="")
+        return
+
+    outputs = await transform(pipeline, "map", task, list(sources.values()), prompt="")
+    expected = [
+        {"source_range": sources[kind].record_id, "start_line": start, "end_line": end}
+        for kind, start, end in spans
+        if kind == "text"
+    ]
+    assert [span.model_dump() for span in response.records[0].evidence_spans] == expected
+    assert len(outputs) == 1
+    stored = await pipeline.files.get(outputs[0].payload_ref)
+    assert stored["evidence_spans"] == expected
+
+
+@pytest.mark.asyncio
+async def test_transform_rejects_unmarked_empty_text_span(runtime):
+    runtime[0].client.read_raw.return_value = ""
+    pipeline, sources, task = await transform_assignment(runtime)
+
+    async def submit(stage, system, data, schema, validate, **kwargs):
+        validate(
+            RecordResponse.model_validate(
+                {
+                    "records": [
+                        {
+                            "inputs": [sources["text"].record_id],
+                            "payload": {"text": "A fact."},
+                            "evidence_spans": [
+                                {
+                                    "source_range": sources["text"].record_id,
+                                    "start_line": 1,
+                                    "end_line": 1,
+                                }
+                            ],
+                        }
+                    ]
+                }
+            )
+        )
+
+    pipeline.model.ask = AsyncMock(side_effect=submit)
+    with pytest.raises(ValueError, match="outside the original source range"):
+        await transform(pipeline, "map", task, list(sources.values()), prompt="")
+
+
+@pytest.mark.asyncio
+async def test_transform_image_span_filter_preserves_map_cache_reuse(runtime):
+    pipeline, sources, task = await transform_assignment(runtime)
+    image, text = sources["image"], sources["text"]
+    text_span = {"source_range": text.record_id, "start_line": 1, "end_line": 2}
+    pipeline.model.provider.chat.return_value = LLMResponse(
+        content=json.dumps(
+            {
+                "records": [
+                    {
+                        "inputs": [image.record_id, text.record_id],
+                        "payload": {"text": "Source facts."},
+                        "evidence_spans": [
+                            {"source_range": image.record_id, "start_line": 1, "end_line": 999},
+                            text_span,
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+    first = await transform(pipeline, "map", task, list(sources.values()), prompt="")
+    cache_keys = {key for key in pipeline.files.values if key.startswith("cache/")}
+    assert len(cache_keys) == 1
+    second = await transform(pipeline, "map", task, list(sources.values()), prompt="")
+
+    assert second == first
+    assert {key for key in pipeline.files.values if key.startswith("cache/")} == cache_keys
+    pipeline.model.provider.chat.assert_awaited_once()
+    assert pipeline.metrics["model_cache_hits"] == 1
+    assert (await pipeline.files.get(second[0].payload_ref))["evidence_spans"] == [text_span]
 
 
 @pytest.mark.asyncio
