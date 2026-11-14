@@ -18,10 +18,11 @@ from vikingbot.agent.loop import AgentLoop, _inline_media_bytes
 from vikingbot.agent.tools.base import MultimodalToolResult, ToolContext
 from vikingbot.agent.tools.compile import CompileImageReadTool, CompileSpawnTool
 from vikingbot.agent.tools.ov_file import VikingMultiReadTool
-from vikingbot.agent.tools.registry import ToolRegistry
+from vikingbot.agent.tools.registry import ToolExecutionResult, ToolRegistry
 from vikingbot.bus.queue import MessageBus
 from vikingbot.compile import entry
 from vikingbot.compile.hashing import content_hash
+from vikingbot.compile.media import bound_inline_images
 from vikingbot.compile.models import CompileFailure, CompileLimits, SanitizedCompileRequest
 from vikingbot.compile.ops.common import pack, payload, transform
 from vikingbot.compile.pipeline import Pipeline
@@ -839,3 +840,191 @@ async def test_multi_read_and_request_budget_still_preserve_native_images(runtim
     with pytest.raises(CompileFailure, match="media budget"):
         await pipeline.model.call("compile", [{"content": result.content}], [], max_tokens=100)
     pipeline.model.provider.chat.assert_not_awaited()
+
+
+def media_message(name, raw, *, mime="image/png"):
+    metadata = {"uri": f"viking://resources/{name}.png", "media_kind": "image", "complete": False}
+    return {
+        "role": "tool",
+        "tool_call_id": name,
+        "content": [
+            {"type": "text", "text": json.dumps(metadata, ensure_ascii=False)},
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64," + base64.b64encode(raw).decode()},
+            },
+        ],
+    }
+
+
+@pytest.mark.parametrize("limit", [9, 20])
+def test_media_within_budget_preserves_exact_messages(limit):
+    messages = [
+        media_message("图一", b"aaa"),
+        media_message("copy", b"aaa"),
+        media_message("other", b"bbb"),
+    ]
+    original = json.dumps(messages, ensure_ascii=False).encode()
+    assert bound_inline_images(messages, limit) is messages
+    assert json.dumps(messages, ensure_ascii=False).encode() == original
+
+
+def test_media_overflow_deduplicates_actual_bytes_without_mutating_inputs():
+    messages = [
+        media_message("a", b"aaa"),
+        media_message("b", b"bbb"),
+        media_message("copy-a", b"aaa", mime="IMAGE/PNG"),
+    ]
+    original = json.dumps(messages)
+    bounded = bound_inline_images(messages, 7)
+    assert json.dumps(messages) == original
+    assert _inline_media_bytes(bounded) == 6
+    notice = json.loads(bounded[2]["content"])
+    assert notice["uri"].endswith("copy-a.png") and notice["image_inline_omitted"] is True
+    assert "duplicate" in notice["media_budget_note"]
+    assert "text facts" in notice["media_budget_note"]
+
+
+def test_media_overflow_keeps_later_images_that_fit():
+    bounded = bound_inline_images(
+        [media_message("a", b"aaa"), media_message("b", b"bbbb"), media_message("c", b"cc")], 5
+    )
+    assert _inline_media_bytes(bounded) == 5
+    assert isinstance(bounded[0]["content"], list) and isinstance(bounded[2]["content"], list)
+    notice = json.loads(bounded[1]["content"])
+    assert notice["uri"].endswith("b.png")
+    assert "budget exhausted" in notice["media_budget_note"]
+
+
+async def seed_media_assignment(pipeline, raw_images):
+    for name, raw in raw_images.items():
+        message = media_message(name, raw)
+        await pipeline.files.put(
+            f"sources/{name}",
+            {**json.loads(message["content"][0]["text"]), "image": message["content"][1]},
+        )
+    return {"inputs": [{"id": name, "payload": {"source_ranges": [name]}} for name in raw_images]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["route", "reduce", "reduce_merge", "review"])
+async def test_direct_non_map_deduplicates_an_overflowing_tool_batch(runtime, monkeypatch, stage):
+    pipeline, _ = runtime
+    monkeypatch.setattr("vikingbot.compile.pipeline_io.MAX_INLINE_TOOL_RESULT_MEDIA_BYTES", 7)
+    data = await seed_media_assignment(pipeline, {"a": b"aaa", "b": b"bbb", "copy-a": b"aaa"})
+    requests = []
+
+    def respond(**kwargs):
+        requests.append(json.loads(json.dumps(kwargs["messages"])))
+        if len(requests) == 1:
+            return LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCallRequest(name, "read_evidence", {"source_range": name}, 0)
+                    for name in ("a", "b", "copy-a")
+                ],
+            )
+        return LLMResponse(content='{"files":[]}')
+
+    pipeline.model.provider.chat.side_effect = respond
+    await pipeline.model.ask(stage, "Use supplied facts.", data, FileResponse)
+    assert len(requests) == 2 and _inline_media_bytes(requests[1]) == 6
+    tools = [m for m in requests[1] if m["role"] == "tool"]
+    assert json.loads(tools[-1]["content"])["image_inline_omitted"] is True
+
+
+@pytest.mark.asyncio
+async def test_read_evidence_budget_accumulates_across_tool_turns(runtime, monkeypatch):
+    pipeline, _ = runtime
+    monkeypatch.setattr("vikingbot.compile.pipeline_io.MAX_INLINE_TOOL_RESULT_MEDIA_BYTES", 5)
+    data = await seed_media_assignment(pipeline, {"a": b"aaa", "b": b"bbbb", "c": b"cc"})
+    requests = []
+
+    def respond(**kwargs):
+        requests.append(json.loads(json.dumps(kwargs["messages"])))
+        names = ["a"] if len(requests) == 1 else ["b", "c"] if len(requests) == 2 else []
+        if names:
+            return LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCallRequest(name, "read_evidence", {"source_range": name}, 0)
+                    for name in names
+                ],
+            )
+        return LLMResponse(content='{"files":[]}')
+
+    pipeline.model.provider.chat.side_effect = respond
+    await pipeline.model.ask("reduce", "Use supplied facts.", data, FileResponse)
+    assert [_inline_media_bytes(request) for request in requests] == [0, 3, 5]
+    tools = {m["tool_call_id"]: m["content"] for m in requests[-1] if m["role"] == "tool"}
+    assert isinstance(tools["a"], list) and isinstance(tools["c"], list)
+    omitted = json.loads(tools["b"])
+    assert omitted["image_inline_omitted"] is True and omitted["uri"].endswith("b.png")
+    assert "budget" in omitted["media_budget_note"]
+
+
+@pytest.mark.asyncio
+async def test_map_read_evidence_still_rejects_one_oversized_image(runtime, monkeypatch):
+    pipeline, _ = runtime
+    monkeypatch.setattr("vikingbot.compile.pipeline_io.MAX_INLINE_TOOL_RESULT_MEDIA_BYTES", 5)
+    data = await seed_media_assignment(pipeline, {"large": b"abcdef"})
+    pipeline.model.provider.chat.return_value = LLMResponse(
+        content="",
+        tool_calls=[ToolCallRequest("large", "read_evidence", {"source_range": "large"}, 0)],
+    )
+    with pytest.raises(CompileFailure, match="media budget"):
+        await pipeline.model.ask("map", "Read original evidence.", data, FileResponse)
+    pipeline.model.provider.chat.assert_awaited_once()
+
+
+@pytest.mark.parametrize("stage", ["map", "map_agent", "reduce_agent"])
+def test_child_budgets_tool_batch_before_generic_agent_limits(runtime, monkeypatch, stage):
+    pipeline, _ = runtime
+    monkeypatch.setattr("vikingbot.compile.pipeline_agent.MAX_INLINE_TOOL_RESULT_MEDIA_BYTES", 5)
+    messages = [{"role": "system", "content": "Read facts."}]
+    results = []
+    for i, (name, raw) in enumerate([("a", b"aaa"), ("b", b"bbbb"), ("c", b"cc")]):
+        message = media_message(name, raw)
+        result = MultimodalToolResult(message["content"][0]["text"], message["content"])
+        results.append(
+            (
+                i,
+                ToolCallRequest(name, "read_evidence", {"source_range": name}, 0),
+                ToolExecutionResult(result, {"source_range": name}, ("skill",), True),
+                0.1,
+            )
+        )
+    child = ChildProvider(pipeline.model, FileResponse, stage)
+    bounded, outcomes = child.prepare_tool_results(messages, results)
+    if stage.startswith("map"):
+        assert bounded is messages and outcomes is results
+        return
+    values = [outcome.result for _, _, outcome, _ in outcomes]
+    assert isinstance(values[0], MultimodalToolResult) and isinstance(
+        values[2], MultimodalToolResult
+    )
+    assert json.loads(values[1])["image_inline_omitted"] is True
+    assert (
+        _inline_media_bytes(
+            [
+                {"content": value.content if isinstance(value, MultimodalToolResult) else value}
+                for value in values
+            ]
+        )
+        == 5
+    )
+    assert all(
+        outcome.skill_uris == ("skill",) and outcome.preserve_complete_result
+        for _, _, outcome, _ in outcomes
+    )
+
+
+@pytest.mark.asyncio
+async def test_child_preserves_within_budget_messages_byte_for_byte(runtime):
+    pipeline, _ = runtime
+    messages = [media_message("图一", b"aaa"), media_message("copy", b"aaa")]
+    before = json.dumps(messages, ensure_ascii=False).encode()
+    pipeline.model.provider.chat.return_value = LLMResponse(content="done")
+    await ChildProvider(pipeline.model, FileResponse, "reduce_agent").chat(messages, tools=[])
+    sent = pipeline.model.provider.chat.call_args.kwargs["messages"]
+    assert sent is messages and json.dumps(sent, ensure_ascii=False).encode() == before

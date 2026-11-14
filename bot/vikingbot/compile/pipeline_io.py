@@ -22,6 +22,7 @@ from openviking.utils.media_limits import MAX_INLINE_TOOL_RESULT_MEDIA_BYTES
 from openviking_cli.exceptions import NotFoundError
 from vikingbot.agent.tools.base import MultimodalToolResult
 from vikingbot.compile.hashing import digest
+from vikingbot.compile.media import bound_inline_images
 from vikingbot.compile.models import COMPILE_STAGING_ROOT, CompileFailure
 from vikingbot.compile.results import FileResponse, RouteBatchResponse
 from vikingbot.compile.schemas import result_schema
@@ -484,6 +485,8 @@ class JsonModel:
             },
             {"role": "user", "content": json.dumps(data, ensure_ascii=False)},
         ]
+        if stage.split("_", 1)[0] != "map":
+            messages = bound_inline_images(messages, MAX_INLINE_TOOL_RESULT_MEDIA_BYTES)
         failures = 0
         retries = Counter()
         seen_results = set()
@@ -553,6 +556,8 @@ class JsonModel:
                                 "content": multimodal.content if multimodal else value,
                             }
                         )
+                    if stage.split("_", 1)[0] != "map":
+                        messages = bound_inline_images(messages, MAX_INLINE_TOOL_RESULT_MEDIA_BYTES)
                     stalled_rounds = 0 if progress else stalled_rounds + 1
                     if stalled_rounds >= 3:
                         raise ModelCallLimitError(f"{stage}: tool calls made no progress")

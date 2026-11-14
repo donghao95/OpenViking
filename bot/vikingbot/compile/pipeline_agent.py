@@ -7,14 +7,17 @@ import json
 import uuid
 from collections import Counter
 from copy import copy
+from dataclasses import replace
 
 import json_repair
 
-from vikingbot.agent.tools.base import Tool
+from openviking.utils.media_limits import MAX_INLINE_TOOL_RESULT_MEDIA_BYTES
+from vikingbot.agent.tools.base import MultimodalToolResult, Tool
 from vikingbot.agent.tools.compile import CompileChildTool
 from vikingbot.agent.tools.registry import ToolRegistry
 from vikingbot.compile import file_ops
 from vikingbot.compile.hashing import content_hash
+from vikingbot.compile.media import bound_inline_images
 from vikingbot.compile.models import COMPILE_DRAFT_ROOT
 from vikingbot.compile.pipeline_io import TaskFiles, retry_allowed
 from vikingbot.compile.renderer import validate_relative_file_path
@@ -43,6 +46,8 @@ class ChildProvider(LLMProvider):
 
     async def chat(self, messages, tools=None, **kwargs):
         """Retry truncated output without executing incomplete tool calls."""
+        if self.stage.split("_", 1)[0] != "map":
+            messages = bound_inline_images(messages, MAX_INLINE_TOOL_RESULT_MEDIA_BYTES)
         while True:
             response = await self.model.call(
                 self.stage, messages, tools, max_tokens=self.model.max_tokens
@@ -54,6 +59,37 @@ class ChildProvider(LLMProvider):
                 raise ValueError(error)
             self.model.metrics["repairs"] += 1
             messages = [*messages, {"role": "user", "content": error}]
+
+    def prepare_tool_results(self, messages, results):
+        """Budget the whole child tool batch before AgentLoop's per-result limit."""
+        if self.stage.split("_", 1)[0] == "map":
+            return messages, results
+        tools = [
+            {
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": outcome.result.content
+                if isinstance(outcome.result, MultimodalToolResult)
+                else outcome.result,
+            }
+            for _, call, outcome, _ in results
+        ]
+        combined = [*messages, *tools]
+        bounded = bound_inline_images(combined, MAX_INLINE_TOOL_RESULT_MEDIA_BYTES)
+        if bounded is combined:
+            return messages, results
+        prepared = []
+        for (index, call, outcome, duration), original, message in zip(
+            results, tools, bounded[len(messages) :], strict=True
+        ):
+            content = message["content"]
+            if content is not original["content"]:
+                value = outcome.result
+                if isinstance(value, MultimodalToolResult) and isinstance(content, list):
+                    content = MultimodalToolResult(value.text, content)
+                outcome = replace(outcome, result=content)
+            prepared.append((index, call, outcome, duration))
+        return bounded[: len(messages)], prepared
 
 
 async def complete_tool_result(result, session_key, *, preserve_complete: bool = False):
@@ -301,6 +337,7 @@ def agent_runner(loop, session_key, connection, limits):
             )
         child = copy(loop)
         child.provider = ChildProvider(model, schema, stage, submit=submit)
+        child._prepare_tool_results = child.provider.prepare_tool_results
         child._preview_tool_result = complete_tool_result
         instructions = (
             "\nUse emit to submit. Supplied Skill attachments are complete; "
