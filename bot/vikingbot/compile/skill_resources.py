@@ -128,7 +128,8 @@ class EvidenceReader(Tool):
     description = (
         "Read assigned original evidence. Optional start_line/end_line are one-based, inclusive "
         "lines within the source_range shard; omit both for the complete shard. "
-        "For image evidence omit line bounds to view the original image."
+        "For image evidence, do not pass start_line or end_line: images have no text line "
+        "numbers. Omit both to view the whole original image."
     )
     parameters = {
         "type": "object",
@@ -182,11 +183,18 @@ class EvidenceReader(Tool):
         if value is None:
             raise ValueError("Assigned source range is missing")
         if value.get("image"):
-            if spans:
-                raise ValueError("Image evidence has no text line ranges")
             return {
                 **{key: item for key, item in value.items() if key != "image" or include_image},
                 "complete": False,
+                **(
+                    {
+                        "line_bounds_ignored": True,
+                        "note": "Image evidence has no line numbers; line bounds were ignored "
+                        "and the whole image was returned.",
+                    }
+                    if spans
+                    else {}
+                ),
             }
         lines = value["text"].splitlines(keepends=True)
         merged = []

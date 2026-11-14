@@ -18,15 +18,18 @@ from vikingbot.agent.loop import AgentLoop, _inline_media_bytes
 from vikingbot.agent.tools.base import MultimodalToolResult, ToolContext
 from vikingbot.agent.tools.compile import CompileImageReadTool, CompileSpawnTool
 from vikingbot.agent.tools.ov_file import VikingMultiReadTool
-from vikingbot.agent.tools.registry import ToolRegistry
+from vikingbot.agent.tools.registry import ToolExecutionResult, ToolRegistry
 from vikingbot.bus.queue import MessageBus
 from vikingbot.compile import entry
 from vikingbot.compile.hashing import content_hash
+from vikingbot.compile.media import bound_inline_images
 from vikingbot.compile.models import CompileFailure, CompileLimits, SanitizedCompileRequest
-from vikingbot.compile.ops.common import pack, payload
+from vikingbot.compile.ops.common import pack, payload, transform
+from vikingbot.compile.ops.finalize import run as finalize
 from vikingbot.compile.pipeline import Pipeline
 from vikingbot.compile.pipeline_agent import ChildProvider, complete_tool_result
 from vikingbot.compile.pipeline_io import ModelCallError
+from vikingbot.compile.plan import Transform
 from vikingbot.compile.results import CombineResponse, FileResponse, RecordResponse
 from vikingbot.compile.service import BotCompileService, _CompileProvider
 from vikingbot.compile.skill_resources import EvidenceReader
@@ -110,6 +113,169 @@ async def seed(runtime):
 
     records = await pipeline.seed(inputs())
     return records[-1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("same_content", [False, True])
+async def test_finalize_preserves_skill_publication_behavior(runtime, monkeypatch, same_content):
+    pipeline, _ = runtime
+    pipeline.skill_target = True
+    path, old = "demo/SKILL.md", "original skill"
+    content = old if same_content else "new skill"
+    pipeline.old = {path: old} if same_content else {}
+    artifact = {
+        "path": path,
+        "owner": "group",
+        "content": content,
+        "sha256": content_hash(content),
+        "source_refs": [],
+        "base_hash": content_hash(old) if same_content else None,
+    }
+    await pipeline.files.put("artifact", artifact)
+    validate = Mock()
+    monkeypatch.setattr("vikingbot.compile.file_ops.validate_skill_output", validate)
+    load_old = AsyncMock(return_value=None)
+    monkeypatch.setattr("vikingbot.compile.file_ops.load_old", load_old)
+    rendered = await finalize(pipeline, ["artifact"])
+    assert validate.call_count == 2
+    if same_content:
+        assert rendered.operations == [] and rendered.unchanged == [f"{pipeline.target}/{path}"]
+        load_old.assert_not_awaited()
+    else:
+        assert rendered.operations == [
+            {"uri": f"{pipeline.target}/{path}", "content": content, "mode": "create"}
+        ]
+        load_old.assert_awaited_once_with(pipeline, path)
+
+
+async def transform_assignment(runtime):
+    pipeline, _ = runtime
+    image = await seed(runtime)
+    text = next(record for record in pipeline.records.values() if record.routing_text == TEXT)
+    pipeline.contract = SimpleNamespace(distinguish=[])
+    return (
+        pipeline,
+        {"image": image, "text": text},
+        Transform(instructions="Extract source facts.", execution="direct"),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "spans,input_kinds,error",
+    [
+        ([("image", 1, 999)], ["image"], None),
+        ([("text", 1, 3)], ["text"], "outside the original source range"),
+        ([("image", 1, 1)], ["text"], "must belong to this record's supporting inputs"),
+        ([("text", 1, 1)], ["image"], "must belong to this record's supporting inputs"),
+        ([("image", 1, 999), ("text", 1, 2)], ["image", "text"], None),
+    ],
+)
+async def test_transform_filters_only_owned_image_spans(runtime, spans, input_kinds, error):
+    pipeline, sources, task = await transform_assignment(runtime)
+    response = RecordResponse.model_validate(
+        {
+            "records": [
+                {
+                    "inputs": [sources[kind].record_id for kind in input_kinds],
+                    "payload": {"text": "Source facts."},
+                    "evidence_spans": [
+                        {
+                            "source_range": sources[kind].record_id,
+                            "start_line": start,
+                            "end_line": end,
+                        }
+                        for kind, start, end in spans
+                    ],
+                }
+            ]
+        }
+    )
+
+    async def submit(stage, system, data, schema, validate, **kwargs):
+        validate(response)
+        return response
+
+    pipeline.model.ask = AsyncMock(side_effect=submit)
+    if error:
+        with pytest.raises(ValueError, match=error):
+            await transform(pipeline, "map", task, list(sources.values()), prompt="")
+        return
+
+    outputs = await transform(pipeline, "map", task, list(sources.values()), prompt="")
+    expected = [
+        {"source_range": sources[kind].record_id, "start_line": start, "end_line": end}
+        for kind, start, end in spans
+        if kind == "text"
+    ]
+    assert [span.model_dump() for span in response.records[0].evidence_spans] == expected
+    assert len(outputs) == 1
+    stored = await pipeline.files.get(outputs[0].payload_ref)
+    assert stored["evidence_spans"] == expected
+
+
+@pytest.mark.asyncio
+async def test_transform_rejects_unmarked_empty_text_span(runtime):
+    runtime[0].client.read_raw.return_value = ""
+    pipeline, sources, task = await transform_assignment(runtime)
+
+    async def submit(stage, system, data, schema, validate, **kwargs):
+        validate(
+            RecordResponse.model_validate(
+                {
+                    "records": [
+                        {
+                            "inputs": [sources["text"].record_id],
+                            "payload": {"text": "A fact."},
+                            "evidence_spans": [
+                                {
+                                    "source_range": sources["text"].record_id,
+                                    "start_line": 1,
+                                    "end_line": 1,
+                                }
+                            ],
+                        }
+                    ]
+                }
+            )
+        )
+
+    pipeline.model.ask = AsyncMock(side_effect=submit)
+    with pytest.raises(ValueError, match="outside the original source range"):
+        await transform(pipeline, "map", task, list(sources.values()), prompt="")
+
+
+@pytest.mark.asyncio
+async def test_transform_image_span_filter_preserves_map_cache_reuse(runtime):
+    pipeline, sources, task = await transform_assignment(runtime)
+    image, text = sources["image"], sources["text"]
+    text_span = {"source_range": text.record_id, "start_line": 1, "end_line": 2}
+    pipeline.model.provider.chat.return_value = LLMResponse(
+        content=json.dumps(
+            {
+                "records": [
+                    {
+                        "inputs": [image.record_id, text.record_id],
+                        "payload": {"text": "Source facts."},
+                        "evidence_spans": [
+                            {"source_range": image.record_id, "start_line": 1, "end_line": 999},
+                            text_span,
+                        ],
+                    }
+                ]
+            }
+        )
+    )
+    first = await transform(pipeline, "map", task, list(sources.values()), prompt="")
+    cache_keys = {key for key in pipeline.files.values if key.startswith("cache/")}
+    assert len(cache_keys) == 1
+    second = await transform(pipeline, "map", task, list(sources.values()), prompt="")
+
+    assert second == first
+    assert {key for key in pipeline.files.values if key.startswith("cache/")} == cache_keys
+    pipeline.model.provider.chat.assert_awaited_once()
+    assert pipeline.metrics["model_cache_hits"] == 1
+    assert (await pipeline.files.get(second[0].payload_ref))["evidence_spans"] == [text_span]
 
 
 @pytest.mark.asyncio
@@ -384,14 +550,16 @@ async def test_image_payload_and_packing_reuse_registered_metadata(runtime, comb
 
 
 @pytest.mark.asyncio
-async def test_image_evidence_view_reads_snapshot_once(runtime):
+@pytest.mark.parametrize("with_line_bounds", [False, True])
+async def test_image_evidence_view_reads_snapshot_once(runtime, with_line_bounds):
     pipeline, png = runtime
     image = await seed(runtime)
     data = {"inputs": [await payload(pipeline, image)]}
     get = AsyncMock(wraps=pipeline.files.get)
     reader = EvidenceReader(SimpleNamespace(get=get), data)
 
-    result = await reader.execute(source_range=image.record_id)
+    bounds = {"start_line": 1, "end_line": 999} if with_line_bounds else {}
+    result = await reader.execute(source_range=image.record_id, **bounds)
 
     get.assert_awaited_once_with(f"sources/{image.record_id}")
     assert isinstance(result, MultimodalToolResult)
@@ -400,12 +568,68 @@ async def test_image_evidence_view_reads_snapshot_once(runtime):
     assert base64.b64decode(attached["image_url"]["url"].split(",", 1)[1]) == png
     assert "base64," not in result.text
     assert "image" not in json.loads(result.text)
+    stored = await pipeline.files.get(image.payload_ref)
+    unbounded = {
+        **{key: value for key, value in stored.items() if key != "image"},
+        "complete": False,
+    }
+    expected = dict(unbounded)
+    if with_line_bounds:
+        expected.update(
+            line_bounds_ignored=True,
+            note="Image evidence has no line numbers; line bounds were ignored "
+            "and the whole image was returned.",
+        )
+    assert json.loads(result.text) == expected
     assert (await pipeline.files.get(image.payload_ref))["image"] == attached
 
     get.reset_mock()
     metadata = await reader.read(image.record_id)
     get.assert_awaited_once_with(f"sources/{image.record_id}")
     assert "image" not in metadata and metadata["complete"] is False
+    assert metadata == unbounded
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_image", [False, True])
+async def test_image_evidence_read_ignores_line_hints(runtime, include_image):
+    pipeline, png = runtime
+    image = await seed(runtime)
+    assignment = await payload(pipeline, image)
+    assignment["payload"]["evidence_spans"] = [
+        {"source_range": image.record_id, "start_line": 1, "end_line": 999}
+    ]
+    reader = EvidenceReader(pipeline.files, {"inputs": [assignment]})
+    stored = await pipeline.files.get(image.payload_ref)
+    original = dict(stored)
+
+    result = await reader.read(
+        image.record_id, reader.spans[image.record_id], include_image=include_image
+    )
+
+    assert result == {
+        **{key: value for key, value in stored.items() if key != "image" or include_image},
+        "complete": False,
+        "line_bounds_ignored": True,
+        "note": "Image evidence has no line numbers; line bounds were ignored "
+        "and the whole image was returned.",
+    }
+    if include_image:
+        assert base64.b64decode(result["image"]["image_url"]["url"].split(",", 1)[1]) == png
+    assert stored == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("start,end", [(0, 1), (1, 3), (2, 1)])
+async def test_text_evidence_still_rejects_invalid_line_bounds(start, end):
+    files = MemoryFiles()
+    await files.put("sources/text", {"uri": TEXT, "text": "one\ntwo\n"})
+    reader = EvidenceReader(files, {"inputs": [{"payload": {"source_ranges": ["text"]}}]})
+
+    with pytest.raises(ValueError, match="outside the original source range"):
+        await reader.read("text", [(start, end)])
+    with pytest.raises(ValueError, match="outside the original source range"):
+        await reader.execute(source_range="text", start_line=start, end_line=end)
 
 
 @pytest.mark.asyncio
@@ -433,8 +657,10 @@ async def test_pipeline_stages_can_reread_original_images(runtime, stage, schema
     messages = pipeline.model.provider.chat.call_args.kwargs["messages"]
     assert _inline_media_bytes(messages) == len(png)
     reader = EvidenceReader(pipeline.files, data)
-    with pytest.raises(ValueError, match="no text line ranges"):
-        await reader.execute(source_range=image.record_id, start_line=1, end_line=1)
+    bounded = await reader.execute(source_range=image.record_id, start_line=1, end_line=1)
+    assert isinstance(bounded, MultimodalToolResult)
+    assert json.loads(bounded.text)["line_bounds_ignored"] is True
+    assert _inline_media_bytes([{"content": bounded.content}]) == len(png)
     with pytest.raises(ValueError, match="outside this assignment"):
         await reader.execute(source_range="foreign")
     result = await reader.execute(source_range=image.record_id)
@@ -648,3 +874,277 @@ async def test_multi_read_and_request_budget_still_preserve_native_images(runtim
     with pytest.raises(CompileFailure, match="media budget"):
         await pipeline.model.call("compile", [{"content": result.content}], [], max_tokens=100)
     pipeline.model.provider.chat.assert_not_awaited()
+
+
+def media_message(name, raw, *, mime="image/png"):
+    metadata = {"uri": f"viking://resources/{name}.png", "media_kind": "image", "complete": False}
+    return {
+        "role": "tool",
+        "tool_call_id": name,
+        "content": [
+            {"type": "text", "text": json.dumps(metadata, ensure_ascii=False)},
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64," + base64.b64encode(raw).decode()},
+            },
+        ],
+    }
+
+
+@pytest.mark.parametrize("limit", [9, 20])
+def test_media_within_budget_preserves_exact_messages(limit):
+    messages = [
+        media_message("图一", b"aaa"),
+        media_message("copy", b"aaa"),
+        media_message("other", b"bbb"),
+    ]
+    original = json.dumps(messages, ensure_ascii=False).encode()
+    assert bound_inline_images(messages, limit) is messages
+    assert json.dumps(messages, ensure_ascii=False).encode() == original
+
+
+def test_media_overflow_deduplicates_actual_bytes_without_mutating_inputs():
+    messages = [
+        media_message("a", b"aaa"),
+        media_message("b", b"bbb"),
+        media_message("copy-a", b"aaa", mime="IMAGE/PNG"),
+    ]
+    original = json.dumps(messages)
+    bounded = bound_inline_images(messages, 7)
+    assert json.dumps(messages) == original
+    assert _inline_media_bytes(bounded) == 6
+    notice = json.loads(bounded[2]["content"])
+    assert notice["uri"].endswith("copy-a.png") and notice["image_inline_omitted"] is True
+    assert "duplicate" in notice["media_budget_note"]
+    assert "text facts" in notice["media_budget_note"]
+
+
+def test_media_overflow_keeps_later_images_that_fit():
+    bounded = bound_inline_images(
+        [media_message("a", b"aaa"), media_message("b", b"bbbb"), media_message("c", b"cc")], 5
+    )
+    assert _inline_media_bytes(bounded) == 5
+    assert isinstance(bounded[0]["content"], list) and isinstance(bounded[2]["content"], list)
+    notice = json.loads(bounded[1]["content"])
+    assert notice["uri"].endswith("b.png")
+    assert "budget exhausted" in notice["media_budget_note"]
+
+
+async def seed_media_assignment(pipeline, raw_images):
+    for name, raw in raw_images.items():
+        message = media_message(name, raw)
+        await pipeline.files.put(
+            f"sources/{name}",
+            {**json.loads(message["content"][0]["text"]), "image": message["content"][1]},
+        )
+    return {"inputs": [{"id": name, "payload": {"source_ranges": [name]}} for name in raw_images]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["route", "reduce", "reduce_merge", "review"])
+async def test_direct_non_map_deduplicates_an_overflowing_tool_batch(runtime, monkeypatch, stage):
+    pipeline, _ = runtime
+    monkeypatch.setattr("vikingbot.compile.pipeline_io.MAX_INLINE_TOOL_RESULT_MEDIA_BYTES", 7)
+    data = await seed_media_assignment(pipeline, {"a": b"aaa", "b": b"bbb", "copy-a": b"aaa"})
+    requests = []
+
+    def respond(**kwargs):
+        requests.append(json.loads(json.dumps(kwargs["messages"])))
+        if len(requests) == 1:
+            return LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCallRequest(name, "read_evidence", {"source_range": name}, 0)
+                    for name in ("a", "b", "copy-a")
+                ],
+            )
+        return LLMResponse(content='{"files":[]}')
+
+    pipeline.model.provider.chat.side_effect = respond
+    await pipeline.model.ask(stage, "Use supplied facts.", data, FileResponse)
+    assert len(requests) == 2 and _inline_media_bytes(requests[1]) == 6
+    tools = [m for m in requests[1] if m["role"] == "tool"]
+    assert json.loads(tools[-1]["content"])["image_inline_omitted"] is True
+
+
+@pytest.mark.asyncio
+async def test_read_evidence_budget_accumulates_across_tool_turns(runtime, monkeypatch):
+    pipeline, _ = runtime
+    monkeypatch.setattr("vikingbot.compile.pipeline_io.MAX_INLINE_TOOL_RESULT_MEDIA_BYTES", 5)
+    data = await seed_media_assignment(pipeline, {"a": b"aaa", "b": b"bbbb", "c": b"cc"})
+    requests = []
+
+    def respond(**kwargs):
+        requests.append(json.loads(json.dumps(kwargs["messages"])))
+        names = ["a"] if len(requests) == 1 else ["b", "c"] if len(requests) == 2 else []
+        if names:
+            return LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCallRequest(name, "read_evidence", {"source_range": name}, 0)
+                    for name in names
+                ],
+            )
+        return LLMResponse(content='{"files":[]}')
+
+    pipeline.model.provider.chat.side_effect = respond
+    await pipeline.model.ask("reduce", "Use supplied facts.", data, FileResponse)
+    assert [_inline_media_bytes(request) for request in requests] == [0, 3, 5]
+    tools = {m["tool_call_id"]: m["content"] for m in requests[-1] if m["role"] == "tool"}
+    assert isinstance(tools["a"], list) and isinstance(tools["c"], list)
+    omitted = json.loads(tools["b"])
+    assert omitted["image_inline_omitted"] is True and omitted["uri"].endswith("b.png")
+    assert "budget" in omitted["media_budget_note"]
+
+
+@pytest.mark.asyncio
+async def test_map_read_evidence_still_rejects_one_oversized_image(runtime, monkeypatch):
+    pipeline, _ = runtime
+    monkeypatch.setattr("vikingbot.compile.pipeline_io.MAX_INLINE_TOOL_RESULT_MEDIA_BYTES", 5)
+    data = await seed_media_assignment(pipeline, {"large": b"abcdef"})
+    pipeline.model.provider.chat.return_value = LLMResponse(
+        content="",
+        tool_calls=[ToolCallRequest("large", "read_evidence", {"source_range": "large"}, 0)],
+    )
+    with pytest.raises(CompileFailure, match="media budget"):
+        await pipeline.model.ask("map", "Read original evidence.", data, FileResponse)
+    pipeline.model.provider.chat.assert_awaited_once()
+
+
+@pytest.mark.parametrize("stage", ["map", "map_agent", "reduce_agent"])
+def test_child_budgets_tool_batch_before_generic_agent_limits(runtime, monkeypatch, stage):
+    pipeline, _ = runtime
+    monkeypatch.setattr("vikingbot.compile.pipeline_agent.MAX_INLINE_TOOL_RESULT_MEDIA_BYTES", 5)
+    messages = [{"role": "system", "content": "Read facts."}]
+    results = []
+    for i, (name, raw) in enumerate([("a", b"aaa"), ("b", b"bbbb"), ("c", b"cc")]):
+        message = media_message(name, raw)
+        result = MultimodalToolResult(message["content"][0]["text"], message["content"])
+        results.append(
+            (
+                i,
+                ToolCallRequest(name, "read_evidence", {"source_range": name}, 0),
+                ToolExecutionResult(result, {"source_range": name}, ("skill",), True),
+                0.1,
+            )
+        )
+    child = ChildProvider(pipeline.model, FileResponse, stage)
+    bounded, outcomes = child.prepare_tool_results(messages, results)
+    if stage.startswith("map"):
+        assert bounded is messages and outcomes is results
+        return
+    values = [outcome.result for _, _, outcome, _ in outcomes]
+    assert isinstance(values[0], MultimodalToolResult) and isinstance(
+        values[2], MultimodalToolResult
+    )
+    assert json.loads(values[1])["image_inline_omitted"] is True
+    assert (
+        _inline_media_bytes(
+            [
+                {"content": value.content if isinstance(value, MultimodalToolResult) else value}
+                for value in values
+            ]
+        )
+        == 5
+    )
+    assert all(
+        outcome.skill_uris == ("skill",) and outcome.preserve_complete_result
+        for _, _, outcome, _ in outcomes
+    )
+
+
+@pytest.mark.asyncio
+async def test_child_preserves_within_budget_messages_byte_for_byte(runtime):
+    pipeline, _ = runtime
+    messages = [media_message("图一", b"aaa"), media_message("copy", b"aaa")]
+    before = json.dumps(messages, ensure_ascii=False).encode()
+    pipeline.model.provider.chat.return_value = LLMResponse(content="done")
+    await ChildProvider(pipeline.model, FileResponse, "reduce_agent").chat(messages, tools=[])
+    sent = pipeline.model.provider.chat.call_args.kwargs["messages"]
+    assert sent is messages and json.dumps(sent, ensure_ascii=False).encode() == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "skill_target,has_conflict,has_output,noop,status",
+    [
+        (False, True, False, False, "completed"),
+        (False, True, True, False, "completed"),
+        (False, False, False, False, "failed"),
+        (False, False, True, False, "completed"),
+        (False, False, False, True, "completed"),
+        (True, False, False, False, "failed"),
+        (True, False, True, False, "completed"),
+    ],
+)
+async def test_pipeline_accounts_for_publication_conflicts_without_claiming_output(
+    runtime, monkeypatch, skill_target, has_conflict, has_output, noop, status
+):
+    from vikingbot.compile import service as compile_service
+
+    pipeline, _ = runtime
+    target = "viking://agent/skills" if skill_target else pipeline.target
+    pipeline.request = pipeline.request.model_copy(update={"to": target})
+    skipped, written = f"{target}/skipped.md", f"{target}/written.md"
+    conflicts = (
+        [{"uri": skipped, "code": "CONFLICT", "message": "Content revision changed"}]
+        if has_conflict
+        else []
+    )
+    published = [written] if has_output else []
+    result = {"created": published, "updated": [], "unchanged": [], "conflicts": conflicts}
+    rendered = compile_service.RenderedBundle(
+        operations=[
+            {"uri": uri, "content": "candidate", "mode": "create"}
+            for uri in [*([skipped] if has_conflict else []), *published]
+        ],
+        created=[*([skipped] if has_conflict else []), *published],
+    )
+    pipeline.noop = noop
+    pipeline.run = AsyncMock(return_value=rendered)
+    pipeline.write_coverage = AsyncMock()
+    await pipeline.files.put("summary", {})
+    monkeypatch.setattr(compile_service, "Pipeline", lambda **kwargs: pipeline)
+    task = SimpleNamespace(status="pending", stage="pending", meta={}, result=None, error=None)
+
+    async def update(task_id, mutate):
+        mutate(task)
+        return task
+
+    service = SimpleNamespace(
+        agent_loop=SimpleNamespace(provider=Mock(), model="fake", temperature=0, tools={}),
+        _model_slots=asyncio.Semaphore(1),
+        limits=pipeline.limits,
+        store=SimpleNamespace(get=AsyncMock(return_value=task), update=update),
+        _write_skill_bundle=AsyncMock(return_value=result),
+    )
+    service._set_state = lambda *args, **kwargs: BotCompileService._set_state(
+        service, *args, **kwargs
+    )
+    client = SimpleNamespace(batch_write=AsyncMock(return_value=result))
+    assert await BotCompileService._run_pipeline(
+        service,
+        task_id="task",
+        request=pipeline.request,
+        client=client,
+        sandbox=SimpleNamespace(),
+        skill_text="",
+        source_files=[],
+        usage={},
+    )
+    assert task.status == status
+    assert task.stage == ("completed" if status == "completed" else "writing")
+    assert (task.error is None) == (status == "completed")
+    assert task.result.conflicts == conflicts
+    assert task.result.page_count == len(published)
+    assert task.result.created == published
+    assert task.result.updated == task.result.unchanged == []
+    pipeline.write_coverage.assert_awaited_once_with(published)
+    assert (await pipeline.files.get("summary"))["conflicts"] == conflicts
+    if has_conflict:
+        assert len(pipeline.warnings) == 1 and skipped in pipeline.warnings[0]
+    if skill_target and not noop:
+        service._write_skill_bundle.assert_awaited_once()
+        client.batch_write.assert_not_awaited()
+    elif rendered.operations:
+        assert client.batch_write.call_args.kwargs["skip_conflicts"] is True

@@ -369,6 +369,10 @@ class LoopToolMixin:
             )
         results = sorted([*activation_results, *regular_results], key=lambda item: item[0])
 
+        prepare = getattr(self, "_prepare_tool_results", None)
+        if prepare is not None:
+            messages, results = prepare(messages, results)
+
         # Stage 3: Process results sequentially in original order
         turn_tools: list[dict[str, Any]] = []
         history_end = len(messages)
