@@ -25,6 +25,7 @@ from vikingbot.compile.hashing import content_hash
 from vikingbot.compile.media import bound_inline_images
 from vikingbot.compile.models import CompileFailure, CompileLimits, SanitizedCompileRequest
 from vikingbot.compile.ops.common import pack, payload, transform
+from vikingbot.compile.ops.finalize import run as finalize
 from vikingbot.compile.pipeline import Pipeline
 from vikingbot.compile.pipeline_agent import ChildProvider, complete_tool_result
 from vikingbot.compile.pipeline_io import ModelCallError
@@ -112,6 +113,39 @@ async def seed(runtime):
 
     records = await pipeline.seed(inputs())
     return records[-1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("same_content", [False, True])
+async def test_finalize_preserves_skill_publication_behavior(runtime, monkeypatch, same_content):
+    pipeline, _ = runtime
+    pipeline.skill_target = True
+    path, old = "demo/SKILL.md", "original skill"
+    content = old if same_content else "new skill"
+    pipeline.old = {path: old} if same_content else {}
+    artifact = {
+        "path": path,
+        "owner": "group",
+        "content": content,
+        "sha256": content_hash(content),
+        "source_refs": [],
+        "base_hash": content_hash(old) if same_content else None,
+    }
+    await pipeline.files.put("artifact", artifact)
+    validate = Mock()
+    monkeypatch.setattr("vikingbot.compile.file_ops.validate_skill_output", validate)
+    load_old = AsyncMock(return_value=None)
+    monkeypatch.setattr("vikingbot.compile.file_ops.load_old", load_old)
+    rendered = await finalize(pipeline, ["artifact"])
+    assert validate.call_count == 2
+    if same_content:
+        assert rendered.operations == [] and rendered.unchanged == [f"{pipeline.target}/{path}"]
+        load_old.assert_not_awaited()
+    else:
+        assert rendered.operations == [
+            {"uri": f"{pipeline.target}/{path}", "content": content, "mode": "create"}
+        ]
+        load_old.assert_awaited_once_with(pipeline, path)
 
 
 async def transform_assignment(runtime):
@@ -1028,3 +1062,89 @@ async def test_child_preserves_within_budget_messages_byte_for_byte(runtime):
     await ChildProvider(pipeline.model, FileResponse, "reduce_agent").chat(messages, tools=[])
     sent = pipeline.model.provider.chat.call_args.kwargs["messages"]
     assert sent is messages and json.dumps(sent, ensure_ascii=False).encode() == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "skill_target,has_conflict,has_output,noop,status",
+    [
+        (False, True, False, False, "completed"),
+        (False, True, True, False, "completed"),
+        (False, False, False, False, "failed"),
+        (False, False, True, False, "completed"),
+        (False, False, False, True, "completed"),
+        (True, False, False, False, "failed"),
+        (True, False, True, False, "completed"),
+    ],
+)
+async def test_pipeline_accounts_for_publication_conflicts_without_claiming_output(
+    runtime, monkeypatch, skill_target, has_conflict, has_output, noop, status
+):
+    from vikingbot.compile import service as compile_service
+
+    pipeline, _ = runtime
+    target = "viking://agent/skills" if skill_target else pipeline.target
+    pipeline.request = pipeline.request.model_copy(update={"to": target})
+    skipped, written = f"{target}/skipped.md", f"{target}/written.md"
+    conflicts = (
+        [{"uri": skipped, "code": "CONFLICT", "message": "Content revision changed"}]
+        if has_conflict
+        else []
+    )
+    published = [written] if has_output else []
+    result = {"created": published, "updated": [], "unchanged": [], "conflicts": conflicts}
+    rendered = compile_service.RenderedBundle(
+        operations=[
+            {"uri": uri, "content": "candidate", "mode": "create"}
+            for uri in [*([skipped] if has_conflict else []), *published]
+        ],
+        created=[*([skipped] if has_conflict else []), *published],
+    )
+    pipeline.noop = noop
+    pipeline.run = AsyncMock(return_value=rendered)
+    pipeline.write_coverage = AsyncMock()
+    await pipeline.files.put("summary", {})
+    monkeypatch.setattr(compile_service, "Pipeline", lambda **kwargs: pipeline)
+    task = SimpleNamespace(status="pending", stage="pending", meta={}, result=None, error=None)
+
+    async def update(task_id, mutate):
+        mutate(task)
+        return task
+
+    service = SimpleNamespace(
+        agent_loop=SimpleNamespace(provider=Mock(), model="fake", temperature=0, tools={}),
+        _model_slots=asyncio.Semaphore(1),
+        limits=pipeline.limits,
+        store=SimpleNamespace(get=AsyncMock(return_value=task), update=update),
+        _write_skill_bundle=AsyncMock(return_value=result),
+    )
+    service._set_state = lambda *args, **kwargs: BotCompileService._set_state(
+        service, *args, **kwargs
+    )
+    client = SimpleNamespace(batch_write=AsyncMock(return_value=result))
+    assert await BotCompileService._run_pipeline(
+        service,
+        task_id="task",
+        request=pipeline.request,
+        client=client,
+        sandbox=SimpleNamespace(),
+        skill_text="",
+        source_files=[],
+        usage={},
+    )
+    assert task.status == status
+    assert task.stage == ("completed" if status == "completed" else "writing")
+    assert (task.error is None) == (status == "completed")
+    assert task.result.conflicts == conflicts
+    assert task.result.page_count == len(published)
+    assert task.result.created == published
+    assert task.result.updated == task.result.unchanged == []
+    pipeline.write_coverage.assert_awaited_once_with(published)
+    assert (await pipeline.files.get("summary"))["conflicts"] == conflicts
+    if has_conflict:
+        assert len(pipeline.warnings) == 1 and skipped in pipeline.warnings[0]
+    if skill_target and not noop:
+        service._write_skill_bundle.assert_awaited_once()
+        client.batch_write.assert_not_awaited()
+    elif rendered.operations:
+        assert client.batch_write.call_args.kwargs["skip_conflicts"] is True

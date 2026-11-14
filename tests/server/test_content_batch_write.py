@@ -5,9 +5,12 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from vikingbot.compile.hashing import content_hash
+from vikingbot.compile.ops import finalize
 
 import openviking.storage.content_write as content_write_module
 from openviking.server.identity import RequestContext, Role
+from openviking.service.compile_targets import CompileVersions
 from openviking.service.task_store import PersistentTaskStore
 from openviking.service.task_tracker import TaskTracker
 from openviking.session.memory.dataclass import MemoryFile
@@ -129,6 +132,114 @@ class _VFS:
         except UnicodeDecodeError:
             self.files[uri] = content
         self.writes.append(uri)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "old,current,base_hash_missing,conflict",
+    [
+        ("original", "original", False, False),
+        ("original", "agent edit", False, True),
+        (None, None, False, False),
+        (None, "agent created", False, True),
+        ("original", "original", True, False),
+        ("original", "agent edit", True, True),
+        ("original", None, False, True),
+        ("", "", False, False),
+    ],
+)
+async def test_compile_finalize_guards_native_batch_publication(
+    _coordinator_queue_for_unit_tests, old, current, base_hash_missing, conflict
+):
+    root, path = "viking://resources/wiki/finalize-cas", "page.md"
+    uri, candidate = f"{root}/{path}", "compiled content"
+    artifact = {
+        "path": path,
+        "owner": "group",
+        "content": candidate,
+        "sha256": content_hash(candidate),
+        "source_refs": ["source"],
+        "base_hash": content_hash(old) if old is not None and not base_hash_missing else None,
+    }
+    runtime = SimpleNamespace(
+        files=SimpleNamespace(get=AsyncMock(return_value=artifact), put=AsyncMock()),
+        target=root,
+        old={path: old},
+        skill_target=False,
+        output_format="wiki",
+    )
+    rendered = await finalize.run(runtime, ["artifact"])
+    operation = rendered.operations[0]
+    if old is None:
+        assert operation["if_absent"] is True and "expected_sha256" not in operation
+    else:
+        assert operation["expected_sha256"] == content_hash(old) and "if_absent" not in operation
+    vfs = _VFS(root, {uri: current} if current is not None else {})
+    coordinator = ContentWriteCoordinator(vfs)
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER)
+    result = await coordinator.batch_write(
+        root_uri=root,
+        operations=rendered.operations,
+        ctx=ctx,
+        wait=False,
+        skip_conflicts=True,
+        defer_processing=True,
+    )
+    assert len(result["conflicts"]) == int(conflict)
+    if conflict:
+        assert not result["created"] and not result["updated"] and not result["unchanged"]
+        assert vfs.files.get(uri) == current and vfs.writes == []
+    else:
+        assert vfs.files[uri] == candidate and vfs.writes == [uri]
+        assert result["updated"] == ([uri] if current is not None else [])
+        assert result["created"] == ([uri] if current is None else [])
+
+
+@pytest.mark.asyncio
+async def test_compile_versions_do_not_claim_preserved_agent_edits():
+    root = "viking://resources/wiki/finalize-cas"
+    uri, task_id = f"{root}/page.md", "compile-task"
+    index = {
+        "uri": uri,
+        "next": 2,
+        "versions": [
+            {
+                "version_id": "agent-version",
+                "source": "agent",
+                "snapshot_id": "agent-snapshot",
+                "snapshot_path": uri,
+                "meta": {"task_id": task_id, "after_compile_snapshot": False},
+            }
+        ],
+    }
+    store = SimpleNamespace(
+        list_version_indexes=AsyncMock(return_value=[index]),
+        get_version_index=AsyncMock(return_value=index),
+        get_outputs=AsyncMock(return_value={"outputs": []}),
+        merge_outputs=AsyncMock(),
+    )
+    fs = SimpleNamespace(show_blob_raw=AsyncMock(return_value={"oid": "preserved-agent-blob"}))
+    versions = CompileVersions(store, fs)
+    versions.owning_target = AsyncMock(return_value={"to": root})
+    versions.append = AsyncMock()
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER)
+    run = {
+        "operation_id": "compile-operation",
+        "actor": "owner",
+        "meta": {"task_id": task_id, "execution": {"mode": "full"}},
+        "params": {"args": {"mode": "full"}},
+    }
+    await versions.record_compile(
+        ctx.account_id,
+        {"to": root},
+        run,
+        "finish-snapshot",
+        [{"uri": uri, "change_type": "modified"}],
+        ctx,
+    )
+    versions.append.assert_not_awaited()
+    store.merge_outputs.assert_awaited_once_with(ctx.account_id, root, "compile-operation", [])
+    assert fs.show_blob_raw.await_count == 2
 
 
 @pytest.mark.asyncio

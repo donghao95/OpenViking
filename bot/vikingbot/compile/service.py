@@ -1281,17 +1281,19 @@ class BotCompileService:
                 warnings=pipeline.warnings,
             )
 
+            completed = bool(published or pipeline.noop or (conflicts and not skill_target))
+
             def complete(task):
                 if task.status not in TERMINAL_STATUSES and task.status != "cancelling":
                     record_metrics(task)
-                    task.status = "completed" if published or pipeline.noop else "failed"
-                    task.stage = "completed" if published or pipeline.noop else "writing"
+                    task.status = "completed" if completed else "failed"
+                    task.stage = "completed" if completed else "writing"
                     task.result = compiled
                     task.error = (
                         CompileErrorInfo(
                             code="COMPILE_INCOMPLETE", message="No output was acknowledged."
                         )
-                        if not published and not pipeline.noop
+                        if not completed
                         else None
                     )
 
